@@ -98,7 +98,7 @@ def write_manual_suggest_control(state):
 def start_control_loop():
     _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /autosuggest")
     write_control("RUNNING")
-    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Status\n/pnl - PnL\n/suggest - Toggle manual suggestions\n/autosuggest - Toggle auto suggestions")
+    _send_message("🤖 Bot Control Ready\n/start - Trading ON\n/stop - Trading OFF\n/status - Status\n/pnl - PnL\n/suggest - Manual [ON/OFF]\n/autosuggest - Auto [ON/OFF]")
     offset = None
     allowed = str(CONFIG.alerting.telegram_chat_id)
     while True:
@@ -129,18 +129,18 @@ def start_control_loop():
                         cur = read_suggest_control().get("state")
                         if cur == "ON":
                             write_suggest_control("OFF")
-                            _send_message("🔕 Auto suggestions DISABLED")
+                            _send_message("Auto: OFF")
                         else:
                             write_suggest_control("ON")
-                            _send_message("🔔 Auto suggestions ENABLED")
+                            _send_message("Auto: ON")
                     elif text in ["/suggest", "/sug"]:
                         ms = read_manual_suggest_control()
                         if ms.get("state") == "OFF":
                             write_manual_suggest_control("ON")
-                            _send_message("🔔 Manual suggestions ENABLED")
+                            _send_message("Manual: ON")
                         else:
                             write_manual_suggest_control("OFF")
-                            _send_message("🔕 Manual suggestions DISABLED")
+                            _send_message("Manual: OFF")
             time.sleep(2)
         except Exception as e:
             _log.warning("control loop error: %s", e)
