@@ -96,9 +96,9 @@ def write_manual_suggest_control(state):
 
 
 def start_control_loop():
-    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /autosuggestion /stopautosuggestion /stopsuggest")
+    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /autosuggest")
     write_control("RUNNING")
-    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Status\n/pnl - PnL\n/suggest - Manual suggestion\n/autosuggestion - Auto suggestions ON\n/stopautosuggestion - Auto suggestions OFF\n/stopsuggest - Manual /suggest OFF")
+    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Status\n/pnl - PnL\n/suggest - Toggle manual suggestions\n/autosuggest - Toggle auto suggestions")
     offset = None
     allowed = str(CONFIG.alerting.telegram_chat_id)
     while True:
@@ -125,30 +125,22 @@ def start_control_loop():
                         _send_message(f"📊 Trading Status: {st}")
                     elif text in ["/pnl", "pnl", "/report"]:
                         _send_message("📈 Check dashboard/logs for PnL")
-                    elif text in ["/autosuggestion", "/autosuggest", "/auto_suggestion", "/startautosuggestion"]:
-                        write_suggest_control("ON")
-                        _send_message("🔔 Auto suggestions ENABLED")
-                    elif text in ["/stopautosuggestion", "/stopautosuggest", "/stop_auto_suggestion"]:
-                        write_suggest_control("OFF")
-                        _send_message("🔕 Auto suggestions DISABLED")
-                    elif text in ["/stopsuggest", "/stop_suggest", "/manualoff"]:
-                        write_manual_suggest_control("OFF")
-                        _send_message("🔕 Manual /suggest DISABLED. Use /suggest to enable again")
+                    elif text in ["/autosuggest", "/autosuggestion", "/auto_suggestion"]:
+                        cur = read_suggest_control().get("state")
+                        if cur == "ON":
+                            write_suggest_control("OFF")
+                            _send_message("🔕 Auto suggestions DISABLED")
+                        else:
+                            write_suggest_control("ON")
+                            _send_message("🔔 Auto suggestions ENABLED")
                     elif text in ["/suggest", "/sug"]:
                         ms = read_manual_suggest_control()
                         if ms.get("state") == "OFF":
                             write_manual_suggest_control("ON")
-                            _send_message("🔔 Manual /suggest ENABLED")
-                        if _suggestion_bot and hasattr(_suggestion_bot, 'analyze_and_suggest'):
-                            try:
-                                if hasattr(_suggestion_bot, 'spot_token') and _suggestion_bot.spot_token:
-                                    _suggestion_bot.analyze_and_suggest(_suggestion_bot.spot_token)
-                                else:
-                                    _send_message("⏳ Waiting for market data...")
-                            except Exception as e:
-                                _send_message(f"⚠️ Error: {e}")
+                            _send_message("🔔 Manual suggestions ENABLED")
                         else:
-                            _send_message("⏳ Suggestion bot not ready yet. Try again in a moment.")
+                            write_manual_suggest_control("OFF")
+                            _send_message("🔕 Manual suggestions DISABLED")
             time.sleep(2)
         except Exception as e:
             _log.warning("control loop error: %s", e)

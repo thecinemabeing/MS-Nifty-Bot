@@ -44,6 +44,14 @@ class TradeSuggestionBot:
             sg = read_suggest_control()
             if sg.get("state") == "OFF":
                 return
+            ms = None
+            try:
+                from telegram_control import read_manual_suggest_control
+                ms = read_manual_suggest_control()
+                if ms.get("state") == "OFF":
+                    return
+            except Exception:
+                pass
             now = time.time()
             if now - self.last_suggest_ts < self.suggest_interval:
                 return
