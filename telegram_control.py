@@ -96,9 +96,9 @@ def write_manual_suggest_control(state):
 
 
 def start_control_loop():
-    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /autosuggestion /stopautosuggestion")
+    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /autosuggestion /stopautosuggestion /stopsuggest")
     write_control("RUNNING")
-    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Status\n/pnl - PnL\n/suggest - Manual suggestion\n/autosuggestion - Auto suggestions ON\n/stopautosuggestion - Auto suggestions OFF")
+    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Status\n/pnl - PnL\n/suggest - Manual suggestion\n/autosuggestion - Auto suggestions ON\n/stopautosuggestion - Auto suggestions OFF\n/stopsuggest - Manual /suggest OFF")
     offset = None
     allowed = str(CONFIG.alerting.telegram_chat_id)
     while True:
@@ -131,7 +131,14 @@ def start_control_loop():
                     elif text in ["/stopautosuggestion", "/stopautosuggest", "/stop_auto_suggestion"]:
                         write_suggest_control("OFF")
                         _send_message("🔕 Auto suggestions DISABLED")
+                    elif text in ["/stopsuggest", "/stop_suggest", "/manualoff"]:
+                        write_manual_suggest_control("OFF")
+                        _send_message("🔕 Manual /suggest DISABLED. Use /suggest to enable again")
                     elif text in ["/suggest", "/sug"]:
+                        ms = read_manual_suggest_control()
+                        if ms.get("state") == "OFF":
+                            write_manual_suggest_control("ON")
+                            _send_message("🔔 Manual /suggest ENABLED")
                         if _suggestion_bot and hasattr(_suggestion_bot, 'analyze_and_suggest'):
                             try:
                                 if hasattr(_suggestion_bot, 'spot_token') and _suggestion_bot.spot_token:
