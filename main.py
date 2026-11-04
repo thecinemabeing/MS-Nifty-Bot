@@ -42,6 +42,7 @@ from order_manager import OrderManager
 from risk_manager import RiskManager
 from strategy import StrategyEngine
 from telegram_control import start_control_loop, read_control
+from telegram_suggestions import TradeSuggestionBot
 from utils import (TradeSide, is_force_square_off_time, is_market_open,
                     now_ist_time,
                     )
@@ -147,6 +148,8 @@ class TradingBot:
         ctrl_thread = threading.Thread(target=start_control_loop, daemon=True)
         ctrl_thread.start()
         _log.info("Telegram control enabled - use /start, /stop, /status from your bot")
+
+        self.suggestion_bot = TradeSuggestionBot(self.kite, self.candles, self.strategy)
 
         self._main_scan_loop()
 
@@ -265,6 +268,12 @@ class TradingBot:
             return  # already evaluated this closed candle
 
         self._update_dashboard_indicators(closed_5m)
+
+        if hasattr(self, 'suggestion_bot') and self.spot_token:
+            try:
+                self.suggestion_bot.analyze_and_suggest(self.spot_token)
+            except Exception:
+                pass
 
         if is_force_square_off_time():
             return  # position_monitor_loop handles the actual square-off
