@@ -125,7 +125,7 @@ def start_control_loop():
                     elif text in ["/stopsuggestion", "/stopsuggestions", "/stopsug", "/stop_suggestion"]:
                         write_suggest_control("OFF")
                         _send_message("🔕 Suggestions STOPPED - Auto suggestions disabled. Use /suggest for manual suggestion")
-                    elif text in ["/suggest", "/suggestion", "/sug", "suggest"]:
+                    elif text in ["/suggest", "/sug", "suggest"]:
                         sg = read_suggest_control()
                         if sg.get("state") == "OFF":
                             _send_message("🔕 Auto suggestions stopped. Getting manual suggestion...")
