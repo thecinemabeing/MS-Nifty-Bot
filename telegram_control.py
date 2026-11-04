@@ -72,10 +72,30 @@ def read_control():
         return {"state": "RUNNING"}
 
 
+SUGGEST_CONTROL_FILE = Path.home() / ".nifty_bot" / "suggest_control.json"
+
+
+def read_suggest_control():
+    if not SUGGEST_CONTROL_FILE.exists():
+        return {"state": "ON"}
+    try:
+        return json.loads(SUGGEST_CONTROL_FILE.read_text())
+    except Exception:
+        return {"state": "ON"}
+
+
+def write_suggest_control(state):
+    data = {"state": state, "updated_at": time.time()}
+    try:
+        SUGGEST_CONTROL_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+
 def start_control_loop():
-    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /suggestion")
+    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /stopsuggestion /startsuggestion")
     write_control("RUNNING")
-    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Check status\n/pnl - Check PnL\n/suggest - Get manual trade suggestion")
+    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Check status\n/pnl - Check PnL\n/suggest - Get manual trade suggestion\n/stopsuggestion - Stop auto suggestions\n/startsuggestion - Start auto suggestions")
     offset = None
     allowed = str(CONFIG.alerting.telegram_chat_id)
     while True:
@@ -102,11 +122,24 @@ def start_control_loop():
                         _send_message(f"📊 Trading Status: {st}")
                     elif text in ["/pnl", "pnl", "/report"]:
                         _send_message("📈 Check dashboard/logs for PnL")
+                    elif text in ["/stopsuggestion", "/stopsuggestions", "/stopsug", "/stop_suggestion"]:
+                        write_suggest_control("OFF")
+                        _send_message("🔕 Suggestions STOPPED - Use /startsuggestion to resume")
+                    elif text in ["/startsuggestion", "/startsuggestions", "/startsug", "/start_suggestion"]:
+                        write_suggest_control("ON")
+                        _send_message("🔔 Suggestions ENABLED - Will send trade suggestions")
                     elif text in ["/suggest", "/suggestion", "/sug", "suggest"]:
+                        sg = read_suggest_control()
+                        if sg.get("state") == "OFF":
+                            _send_message("🔕 Suggestions are OFF. Use /startsuggestion to enable")
+                            continue
                         if _suggestion_bot and hasattr(_suggestion_bot, 'analyze_and_suggest'):
                             try:
                                 _send_message("🔍 Analyzing current market...")
-                                _suggestion_bot.analyze_and_suggest(_suggestion_bot.spot_token) if hasattr(_suggestion_bot, 'spot_token') else _send_message("⏳ Waiting for market data...")
+                                if hasattr(_suggestion_bot, 'spot_token') and _suggestion_bot.spot_token:
+                                    _suggestion_bot.analyze_and_suggest(_suggestion_bot.spot_token)
+                                else:
+                                    _send_message("⏳ Waiting for market data...")
                             except Exception as e:
                                 _send_message(f"⚠️ Error: {e}")
                         else:

@@ -8,6 +8,7 @@ from pathlib import Path
 from config import CONFIG
 from logger import get_logger
 from indicators import ema_series, adx, atr
+from telegram_control import read_suggest_control
 
 _log = get_logger("telegram_suggestions")
 
@@ -40,6 +41,9 @@ class TradeSuggestionBot:
 
     def analyze_and_suggest(self, spot_token):
         try:
+            sg = read_suggest_control()
+            if sg.get("state") == "OFF":
+                return
             now = time.time()
             if now - self.last_suggest_ts < self.suggest_interval:
                 return
