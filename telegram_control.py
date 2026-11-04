@@ -93,9 +93,9 @@ def write_suggest_control(state):
 
 
 def start_control_loop():
-    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /stopsuggestion /startsuggestion")
+    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /stopsuggestion")
     write_control("RUNNING")
-    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Check status\n/pnl - Check PnL\n/suggest - Get manual trade suggestion\n/stopsuggestion - Stop auto suggestions\n/startsuggestion - Start auto suggestions")
+    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Check status\n/pnl - Check PnL\n/suggest - Get manual trade suggestion\n/stopsuggestion - Stop auto suggestions")
     offset = None
     allowed = str(CONFIG.alerting.telegram_chat_id)
     while True:
@@ -124,18 +124,13 @@ def start_control_loop():
                         _send_message("📈 Check dashboard/logs for PnL")
                     elif text in ["/stopsuggestion", "/stopsuggestions", "/stopsug", "/stop_suggestion"]:
                         write_suggest_control("OFF")
-                        _send_message("🔕 Suggestions STOPPED - Use /startsuggestion to resume")
-                    elif text in ["/startsuggestion", "/startsuggestions", "/startsug", "/start_suggestion"]:
-                        write_suggest_control("ON")
-                        _send_message("🔔 Suggestions ENABLED - Will send trade suggestions")
+                        _send_message("🔕 Suggestions STOPPED - Auto suggestions disabled. Use /suggest for manual suggestion")
                     elif text in ["/suggest", "/suggestion", "/sug", "suggest"]:
                         sg = read_suggest_control()
                         if sg.get("state") == "OFF":
-                            _send_message("🔕 Suggestions are OFF. Use /startsuggestion to enable")
-                            continue
+                            _send_message("🔕 Auto suggestions stopped. Getting manual suggestion...")
                         if _suggestion_bot and hasattr(_suggestion_bot, 'analyze_and_suggest'):
                             try:
-                                _send_message("🔍 Analyzing current market...")
                                 if hasattr(_suggestion_bot, 'spot_token') and _suggestion_bot.spot_token:
                                     _suggestion_bot.analyze_and_suggest(_suggestion_bot.spot_token)
                                 else:
