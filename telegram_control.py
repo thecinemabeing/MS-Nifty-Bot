@@ -76,26 +76,29 @@ SUGGEST_CONTROL_FILE = Path.home() / ".nifty_bot" / "suggest_control.json"
 
 
 def read_suggest_control():
-    if not SUGGEST_CONTROL_FILE.exists():
-        return {"state": "ON"}
-    try:
-        return json.loads(SUGGEST_CONTROL_FILE.read_text())
-    except Exception:
-        return {"state": "ON"}
+    global _auto_suggest_enabled
+    return {"state": "ON" if _auto_suggest_enabled else "OFF"}
 
 
 def write_suggest_control(state):
-    data = {"state": state, "updated_at": time.time()}
-    try:
-        SUGGEST_CONTROL_FILE.write_text(json.dumps(data))
-    except Exception:
-        pass
+    global _auto_suggest_enabled
+    _auto_suggest_enabled = (state == "ON")
+
+
+def read_manual_suggest_control():
+    global _manual_suggest_enabled
+    return {"state": "ON" if _manual_suggest_enabled else "OFF"}
+
+
+def write_manual_suggest_control(state):
+    global _manual_suggest_enabled
+    _manual_suggest_enabled = (state == "ON")
 
 
 def start_control_loop():
-    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /stopsuggestion")
+    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /autosuggestion /stopautosuggestion")
     write_control("RUNNING")
-    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Check status\n/pnl - Check PnL\n/suggest - Get manual trade suggestion\n/stopsuggestion - Stop auto suggestions")
+    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Status\n/pnl - PnL\n/suggest - Manual suggestion\n/autosuggestion - Auto suggestions ON\n/stopautosuggestion - Auto suggestions OFF")
     offset = None
     allowed = str(CONFIG.alerting.telegram_chat_id)
     while True:
@@ -122,13 +125,13 @@ def start_control_loop():
                         _send_message(f"📊 Trading Status: {st}")
                     elif text in ["/pnl", "pnl", "/report"]:
                         _send_message("📈 Check dashboard/logs for PnL")
-                    elif text in ["/stopsuggestion", "/stopsuggestions", "/stopsug", "/stop_suggestion"]:
+                    elif text in ["/autosuggestion", "/autosuggest", "/auto_suggestion", "/startautosuggestion"]:
+                        write_suggest_control("ON")
+                        _send_message("🔔 Auto suggestions ENABLED")
+                    elif text in ["/stopautosuggestion", "/stopautosuggest", "/stop_auto_suggestion"]:
                         write_suggest_control("OFF")
-                        _send_message("🔕 Suggestions STOPPED - Auto suggestions disabled. Use /suggest for manual suggestion")
-                    elif text in ["/suggest", "/sug", "suggest"]:
-                        sg = read_suggest_control()
-                        if sg.get("state") == "OFF":
-                            _send_message("🔕 Auto suggestions stopped. Getting manual suggestion...")
+                        _send_message("🔕 Auto suggestions DISABLED")
+                    elif text in ["/suggest", "/sug"]:
                         if _suggestion_bot and hasattr(_suggestion_bot, 'analyze_and_suggest'):
                             try:
                                 if hasattr(_suggestion_bot, 'spot_token') and _suggestion_bot.spot_token:
