@@ -13,6 +13,15 @@ CONTROL_FILE = Path.home() / ".nifty_bot" / "bot_control.json"
 CONTROL_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
+# Global reference for suggestion bot
+_suggestion_bot = None
+
+
+def set_suggestion_bot(bot):
+    global _suggestion_bot
+    _suggestion_bot = bot
+
+
 def _get_updates(offset=None):
     token = CONFIG.alerting.telegram_bot_token
     if not token:
@@ -64,9 +73,9 @@ def read_control():
 
 
 def start_control_loop():
-    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl")
+    _log.info("Telegram command listener started. Commands: /start /stop /status /pnl /suggest /suggestion")
     write_control("RUNNING")
-    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Check status\n/pnl - Check PnL")
+    _send_message("🤖 Bot Control Ready\n/start - Enable trading\n/stop - Disable trading\n/status - Check status\n/pnl - Check PnL\n/suggest - Get manual trade suggestion")
     offset = None
     allowed = str(CONFIG.alerting.telegram_chat_id)
     while True:
@@ -92,9 +101,16 @@ def start_control_loop():
                         st = read_control().get("state")
                         _send_message(f"📊 Trading Status: {st}")
                     elif text in ["/pnl", "pnl", "/report"]:
-                        from risk_manager import RiskManager
-                        # Try to get from global if exists
-                        _send_message("📈 Use dashboard or check logs for detailed PnL")
+                        _send_message("📈 Check dashboard/logs for PnL")
+                    elif text in ["/suggest", "/suggestion", "/sug", "suggest"]:
+                        if _suggestion_bot and hasattr(_suggestion_bot, 'analyze_and_suggest'):
+                            try:
+                                _send_message("🔍 Analyzing current market...")
+                                _suggestion_bot.analyze_and_suggest(_suggestion_bot.spot_token) if hasattr(_suggestion_bot, 'spot_token') else _send_message("⏳ Waiting for market data...")
+                            except Exception as e:
+                                _send_message(f"⚠️ Error: {e}")
+                        else:
+                            _send_message("⏳ Suggestion bot not ready yet. Try again in a moment.")
             time.sleep(2)
         except Exception as e:
             _log.warning("control loop error: %s", e)

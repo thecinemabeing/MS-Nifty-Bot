@@ -41,7 +41,7 @@ from option_selector import OptionUniverse
 from order_manager import OrderManager
 from risk_manager import RiskManager
 from strategy import StrategyEngine
-from telegram_control import start_control_loop, read_control
+from telegram_control import start_control_loop, read_control, set_suggestion_bot
 from telegram_suggestions import TradeSuggestionBot
 from utils import (TradeSide, is_force_square_off_time, is_market_open,
                     now_ist_time,
@@ -150,6 +150,8 @@ class TradingBot:
         _log.info("Telegram control enabled - use /start, /stop, /status from your bot")
 
         self.suggestion_bot = TradeSuggestionBot(self.kite, self.candles, self.strategy)
+        self.suggestion_bot.spot_token = None
+        set_suggestion_bot(self.suggestion_bot)
 
         self._main_scan_loop()
 
@@ -269,7 +271,8 @@ class TradingBot:
 
         self._update_dashboard_indicators(closed_5m)
 
-        if hasattr(self, 'suggestion_bot') and self.spot_token:
+        if hasattr(self, 'suggestion_bot'):
+            self.suggestion_bot.spot_token = self.spot_token
             try:
                 self.suggestion_bot.analyze_and_suggest(self.spot_token)
             except Exception:
