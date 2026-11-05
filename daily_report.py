@@ -25,7 +25,42 @@ _DAY_CSV = CONFIG.logging.log_dir / "daily_report.csv"
 _DAY_DIR = CONFIG.logging.log_dir / "daily_reports"
 
 
-def _summarize_trades(trades: list[dict]) -> dict:
+def _estimate_kite_charges(trades: list[dict]) -> float:
+    """Estimate Zerodha charges for option trades (buy+sell)."""
+    total = 0.0
+    for t in trades:
+        qty = abs(int(t.get("quantity") or 0))
+        if qty <= 0:
+            continue
+        entry = float(t.get("entry_price") or 0)
+        exitp = float(t.get("exit_price") or 0)
+        turnover = (entry + exitp) * qty
+        # Brokerage: ₹20 per executed order (buy+sell = 2 orders), capped by 0.1% not applicable for options flat ₹20
+        brokerage = 2 * CONFIG.backtest.option_brokerage_per_order
+def _estimate_kite_charges(trades: list[dict]) -> float:
+    """Estimate Zerodha charges for option trades (buy+sell)."""
+    total = 0.0
+    for t in trades:
+        qty = abs(int(t.get("quantity") or 0))
+        if qty <= 0:
+            continue
+        entry = float(t.get("entry_price") or 0)
+        exitp = float(t.get("exit_price") or 0)
+        turnover = (entry + exitp) * qty
+        # Brokerage: ₹20 per executed order (buy+sell = 2 orders), capped by 0.1% not applicable for options flat ₹20
+        brokerage = 2 * CONFIG.backtest.option_brokerage_per_order
+        # STT on sell side: 0.0625% on premium for options (sell)
+        stt = exitp * qty * 0.000625
+        # Exchange txn charges (NSE options): ~0.053% on premium turnover
+        exch = turnover * 0.00053
+        # GST on brokerage + exchange charges
+        gst = (brokerage + exch) * CONFIG.backtest.option_gst_pct
+        # SEBI charges: ~₹10/crore
+        sebi = turnover * 0.000001
+        # Stamp duty on buy side: ~0.003% of premium
+        stamp = entry * qty * 0.00003
+        total += brokerage + stt + exch + gst + sebi + stamp
+    return round(total, 2)
     trades_count = len(trades)
     wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
     losses = trades_count - wins
@@ -33,6 +68,8 @@ def _summarize_trades(trades: list[dict]) -> dict:
     win_rate = round(wins / trades_count * 100, 2) if trades_count else 0.0
     gross_profit = round(sum(t.get("pnl", 0.0) for t in trades if (t.get("pnl") or 0) > 0), 2)
     gross_loss = round(abs(sum(t.get("pnl", 0.0) for t in trades if (t.get("pnl") or 0) <= 0)), 2)
+    charges = _estimate_kite_charges(trades)
+    net_after_charges = round(net_pnl - charges, 2)
 
     # individual trade details
     trade_details = []
@@ -62,6 +99,8 @@ def _summarize_trades(trades: list[dict]) -> dict:
         "win_rate_pct": win_rate,
         "gross_profit": gross_profit,
         "gross_loss": gross_loss,
+        "charges": charges,
+        "net_after_charges": net_after_charges,
         "trades": trade_details,
     }
 
@@ -155,12 +194,12 @@ def send_daily_report_telegram() -> None:
     if not summary:
         return
     text = (
-        f"[NIFTY Bot] Daily Report {today_str}\n"
+        f"Daily Report {today_str}\n"
         f"Trades: {summary['trades_count']} ({summary['wins']}W/{summary['losses']}L)\n"
         f"Net PnL: Rs.{summary['net_pnl']:,.2f}\n"
-        f"WinRate: {summary['win_rate_pct']}%\n"
-        f"GrossProfit: Rs.{summary['gross_profit']:,.2f}\n"
-        f"GrossLoss: Rs.{summary['gross_loss']:,.2f}"
+        f"Charges: Rs.{summary.get('charges', 0):,.2f}\n"
+        f"Net After Charges: Rs.{summary.get('net_after_charges', 0):,.2f}\n"
+        f"WinRate: {summary['win_rate_pct']}%"
     )
     send_telegram_alert("DAILY_REPORT", text)
 
