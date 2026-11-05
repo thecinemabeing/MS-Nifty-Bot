@@ -309,6 +309,14 @@ class KiteAPI:
             raise
 
     @retry_with_backoff()
+    def ltp(self, tokens: list[str]) -> dict:
+        try:
+            return self.kite.ltp(tokens)
+        except Exception:
+            _log.exception("Failed to fetch ltp")
+            raise
+
+    @retry_with_backoff()
     def historical_data(self, instrument_token, from_date, to_date, interval, continuous=False, oi=False):
         try:
             return self.kite.historical_data(instrument_token, from_date, to_date, interval, continuous=continuous, oi=oi)
