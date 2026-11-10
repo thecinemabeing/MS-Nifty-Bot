@@ -520,18 +520,102 @@ class KiteAPI:
 
 
     # ------------------------------------------------------------
-    # WEBSOCKET (minimal stub for compatibility)
+    # WEBSOCKET (real KiteTicker - live ticks drive the scan loop)
     # ------------------------------------------------------------
 
     def start_ticker(self, tokens, on_tick: Callable) -> None:
+        if not tokens:
+            _log.warning("start_ticker called with no tokens")
+            return
         self._tick_callback = on_tick
-        _log.info("Ticker started (stub) for tokens: %s", tokens)
+        self._subscribed_tokens.update(tokens)
+        if self._ticker is not None:
+            try:
+                self._ticker.subscribe(tokens)
+                self._ticker.set_mode(self._ticker.MODE_LTP, tokens)
+                _log.info("Ticker already running - subscribed %d tokens", len(tokens))
+                return
+            except Exception:
+                _log.exception("Failed to reuse existing ticker")
+        try:
+            self._ticker = KiteTicker(
+                CONFIG.kite.api_key,
+                CONFIG.kite.access_token,
+                debug=False,
+                reconnect=True,
+                reconnect_max_tries=50,
+                reconnect_max_delay=60,
+                connect_timeout=30,
+            )
+            self._ticker.on_open = self._on_ws_open
+            self._ticker.on_connect = self._on_ws_connect
+            self._ticker.on_ticks = self._on_ws_ticks
+            self._ticker.on_error = self._on_ws_error
+            self._ticker.on_close = self._on_ws_close
+            self._ticker.on_reconnect = self._on_ws_reconnect
+            self._ticker.on_noreconnect = self._on_ws_noreconnect
+            self._ws_thread = threading.Thread(
+                target=self._ticker.connect, name="kite-ticker", daemon=True
+            )
+            self._ws_thread.start()
+            _log.info("KiteTicker thread started for %d tokens", len(tokens))
+        except Exception:
+            _log.exception("Failed to start KiteTicker")
+            self._ticker = None
+
+    def _on_ws_open(self, ws):
+        _log.info("WebSocket opened")
+
+    def _on_ws_connect(self, ws, response):
+        try:
+            tokens = list(self._subscribed_tokens)
+            if tokens:
+                ws.subscribe(tokens)
+                ws.set_mode(ws.MODE_LTP, tokens)
+                _log.info("WebSocket connected - subscribed %d tokens", len(tokens))
+            self._ws_connected.set()
+        except Exception:
+            _log.exception("on_connect handler failed")
+
+    def _on_ws_ticks(self, ws, ticks):
+        try:
+            if self._tick_callback:
+                self._tick_callback(ticks)
+        except Exception:
+            _log.exception("tick callback raised")
+
+    def _on_ws_error(self, ws, code, reason):
+        _log.warning("WebSocket error: code=%s reason=%s", code, reason)
+
+    def _on_ws_close(self, ws, code, reason):
+        self._ws_connected.clear()
+        _log.warning("WebSocket closed: code=%s reason=%s", code, reason)
+
+    def _on_ws_reconnect(self, ws, code, reason):
+        _log.info("WebSocket reconnecting: code=%s reason=%s", code, reason)
+
+    def _on_ws_noreconnect(self, code, reason):
+        _log.error("WebSocket gave up reconnecting: code=%s reason=%s", code, reason)
 
     def wait_until_connected(self, timeout: int = 20) -> bool:
-        return True
+        return self._ws_connected.wait(timeout=timeout)
+
+    def add_subscription(self, token) -> None:
+        self._subscribed_tokens.add(token)
+        if self._ticker is not None:
+            try:
+                self._ticker.subscribe([token])
+                self._ticker.set_mode(self._ticker.MODE_LTP, [token])
+            except Exception:
+                _log.exception("add_subscription failed for token %s", token)
 
     def remove_subscription(self, token) -> None:
-        pass
+        self._subscribed_tokens.discard(token)
+        if self._ticker is not None:
+            try:
+                self._ticker.unsubscribe([token])
+            except Exception:
+                _log.exception("remove_subscription failed for token %s", token)
 
     def set_paper_equity(self, equity: float) -> None:
         self._paper_equity = equity

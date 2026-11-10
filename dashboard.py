@@ -20,14 +20,46 @@ from typing import Any
 from config import CONFIG
 from logger import get_logger, read_recent_decisions
 from trade_journal import read_recent_trades
-
 _log = get_logger("dashboard")
+
+_LABELS = {
+    "nifty_spot": "Nifty Spot",
+    "atm_strike": "ATM Strike",
+    "option_premium": "Option Premium",
+    "trend": "Trend",
+    "ema20": "EMA 20",
+    "ema50": "EMA 50",
+    "vwap": "VWAP",
+    "adx": "ADX (14)",
+    "adx_kite": "ADX (10, Kite-style)",
+    "atr": "ATR",
+    "adr_14": "ADR (14d)",
+    "pdh": "PDH",
+    "pdl": "PDL",
+    "pdc": "PDC",
+    "pivot": "Pivot",
+    "s1": "S1",
+    "r1": "R1",
+    "signal": "Signal",
+    "position": "Position",
+    "entry_price": "Entry Price",
+    "current_pnl": "Current P&L",
+    "daily_pnl": "Daily P&L",
+    "available_margin": "Available Margin",
+    "margin_used": "Margin Used",
+    "trades_today": "Trades Today",
+    "win_rate": "Win Rate",
+    "mode": "Mode",
+}
+
 
 _state_lock = threading.Lock()
 _state: dict[str, Any] = {
     "nifty_spot": None, "atm_strike": None, "option_premium": None,
     "trend": None, "ema20": None, "ema50": None, "vwap": None,
-    "adx": None, "atr": None, "signal": None,
+    "adx": None, "atr": None, "adr_14": None,
+    "pdh": None, "pdl": None, "pdc": None, "pivot": None, "s1": None, "r1": None,
+    "signal": None,
     "position": None, "entry_price": None, "current_pnl": None,
     "daily_pnl": None, "available_margin": None, "margin_used": None,
     "trades_today": None, "win_rate": None,
@@ -59,7 +91,7 @@ td.label{color:#7fdc9a;width:220px;}
 <h1>NIFTY Weekly Options Bot</h1>
 <h2 style="color:#7fdc9a;font-weight:normal;margin-top:4px;">
   Mode: <span id="mode">-</span> &nbsp;|&nbsp;
-  Paper Trading with Real Angel One Live Data
+  Paper Trading with Real Kite Live Data
 </h2>
 <table id="state"></table>
 <h2>Recent Decisions</h2>
@@ -67,6 +99,7 @@ td.label{color:#7fdc9a;width:220px;}
 <h2>Recent Trades</h2>
 <div class="decisions" id="trades"></div>
 <script>
+const _LABELS = ${LABELS_JS};
 async function refresh() {
   const res = await fetch('/api/state');
   const data = await res.json();
@@ -74,8 +107,9 @@ async function refresh() {
   const t = document.getElementById('state');
   t.innerHTML = '';
   for (const [k, v] of Object.entries(data)) {
+    const label = _LABELS[k] || k;
     const row = document.createElement('tr');
-    row.innerHTML = `<td class="label">${k}</td><td>${v === null || v === undefined ? '-' : v}</td>`;
+    row.innerHTML = `<td class="label">${label}</td><td>${v === null || v === undefined ? '-' : v}</td>`;
     t.appendChild(row);
   }
   const dres = await fetch('/api/decisions');
@@ -105,7 +139,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/trades"):
             self._send_json(read_recent_trades(100))
         else:
-            page = _PAGE.replace("REFRESH_MS", str(int(CONFIG.dashboard.refresh_interval_sec * 1000)))
+            page = _PAGE
+            page = page.replace("REFRESH_MS", str(int(CONFIG.dashboard.refresh_interval_sec * 1000)))
+            page = page.replace("${LABELS_JS}", json.dumps(_LABELS))
             body = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

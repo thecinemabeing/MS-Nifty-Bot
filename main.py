@@ -27,7 +27,7 @@ import signal
 import sys
 import threading
 import time as _time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 import dashboard
 import daily_report
@@ -41,7 +41,7 @@ from option_selector import OptionUniverse
 from order_manager import OrderManager
 from risk_manager import RiskManager
 from strategy import StrategyEngine
-from telegram_control import start_control_loop, read_control, set_suggestion_bot
+from telegram_control import start_control_loop, read_control, set_suggestion_bot, panic_requested, clear_panic
 from telegram_suggestions import TradeSuggestionBot
 from utils import (TradeSide, is_force_square_off_time, is_market_open,
                     now_ist_time,
@@ -116,10 +116,35 @@ class TradingBot:
 
         send_telegram_alert("BOT_START", f"Mode={CONFIG.mode.value} user={profile.get('name') or profile.get('clientcode') or 'unknown'}")
 
+        # Clear any pending restart flag so the supervisor relaunch is clean.
+        try:
+            from telegram_control import clear_restart
+            clear_restart()
+        except Exception:
+            pass
+
         self._load_session_state()
+
+        # Rebuild today's risk counters from the trade journal so the
+        # dashboard shows the full day's P&L after a mid-day restart.
+        try:
+            from datetime import datetime as _dt
+            self.risk.rebuild_today_from_journal(_dt.now().date())
+        except Exception:
+            _log.exception("rebuild_today_from_journal failed")
 
         self.spot_token = self.option_universe.get_spot_instrument_token()
         self._warm_up_history()
+
+        # Push rebuilt counters to the dashboard immediately (the scan
+        # loop only updates state while the market is open).
+        try:
+            self._update_dashboard_indicators(
+                self.candles.get_closed_candles(self.spot_token, CONFIG.session.primary_timeframe_min)
+                or []
+            )
+        except Exception:
+            _log.exception("initial dashboard update failed")
 
         tokens = [self.spot_token]
         self.kite.start_ticker(tokens, on_tick=self._on_ticks)
@@ -157,22 +182,42 @@ class TradingBot:
 
     def _warm_up_history(self) -> None:
         now = datetime.now()
-        from_dt = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        if from_dt > now:
-            from_dt = now - timedelta(hours=2)
+        # Load several days so ADX/ATR/EMA50 are available early in the session.
+        from_dt = now - timedelta(days=7)
         try:
             bars_5m = self.kite.historical_data(self.spot_token, from_dt, now, "5minute")
             bars_15m = self.kite.historical_data(self.spot_token, from_dt, now, "15minute")
             self.candles.load_historical(self.spot_token, CONFIG.session.primary_timeframe_min, bars_5m)
             self.candles.load_historical(self.spot_token, CONFIG.session.higher_timeframe_min, bars_15m)
+            _log.info("Warm-up loaded %d 5m / %d 15m bars (7d lookback)",
+                      len(bars_5m or []), len(bars_15m or []))
         except Exception:
             _log.exception("Historical warm-up fetch failed - continuing, will build from live ticks.")
+        try:
+            daily = self.kite.historical_data(self.spot_token, now - timedelta(days=30), now, "day")
+            if daily and len(daily) >= 2:
+                # previous completed day (last may be today)
+                prev = daily[-2] if str(daily[-1].get('date',''))[:10] == now.strftime('%Y-%m-%d') else daily[-1]
+                pdh, pdl, pdc = float(prev['high']), float(prev['low']), float(prev['close'])
+                pivot = (pdh + pdl + pdc) / 3.0
+                ranges = [float(b['high']) - float(b['low']) for b in daily[:-1] if b.get('high') and b.get('low')]
+                adr = sum(ranges[-14:]) / len(ranges[-14:]) if ranges else None
+                self._market_levels = {
+                    'pdh': round(pdh,2), 'pdl': round(pdl,2), 'pdc': round(pdc,2),
+                    'pivot': round(pivot,2),
+                    's1': round(2*pivot - pdh, 2), 'r1': round(2*pivot - pdl, 2),
+                    'adr_14': round(adr, 2) if adr else None,
+                }
+                _log.info("Market levels: %s", self._market_levels)
+        except Exception:
+            _log.exception("Failed to load daily market levels")
 
     # ------------------------------------------------------------
     # TICK HANDLING
     # ------------------------------------------------------------
 
     def _on_ticks(self, ticks: list[dict]) -> None:
+        self._tick_count = getattr(self, "_tick_count", 0) + len(ticks)
         for t in ticks:
             token = t.get("instrument_token")
             price = t.get("last_price")
@@ -239,6 +284,22 @@ class TradingBot:
 
     def _scan_iteration_guard(self, last_processed_bar_ts) -> None:
         ctrl = read_control()
+        if panic_requested():
+            if is_market_open():
+                try:
+                    self.order_mgr.force_square_off_all()
+                except Exception:
+                    _log.exception("Panic square-off failed")
+            clear_panic()
+            write_control("STOPPED") if False else None
+            try:
+                from telegram_control import write_control as _wc
+                _wc("STOPPED")
+                from logger import send_telegram_alert
+                send_telegram_alert("PANIC_EXECUTED", "Panic processed: stopped and square-off attempted.")
+            except Exception:
+                pass
+            return
         if ctrl.get("state") == "STOPPED":
             return
 
@@ -263,13 +324,13 @@ class TradingBot:
         closed_5m = self.candles.get_closed_candles(self.spot_token, CONFIG.session.primary_timeframe_min)
         if not closed_5m:
             return
+        # update dashboard even during warm-up (strategy still requires 45 bars)
+        self._update_dashboard_indicators(closed_5m)
         if len(closed_5m) < 45:
             return
         latest_bar_ts = closed_5m[-1].ts
         if latest_bar_ts == last_processed_bar_ts:
             return  # already evaluated this closed candle
-
-        self._update_dashboard_indicators(closed_5m)
 
         if hasattr(self, 'suggestion_bot'):
             self.suggestion_bot.spot_token = self.spot_token
@@ -305,8 +366,17 @@ class TradingBot:
 
         signal = self.strategy.evaluate(closed_5m, closed_15m, vwap_series, symbol="NIFTY")
         if signal.side in (TradeSide.LONG, TradeSide.SHORT):
-            if CONFIG.session.enable_time_based_entry_gate and now_ist_time() < CONFIG.session.setup_scan_start:
-                return
+            now_t = now_ist_time()
+            start_t = getattr(CONFIG.session, 'setup_scan_start', dtime(9, 20))
+            cutoff_t = getattr(CONFIG.session, 'entry_cutoff_time', getattr(CONFIG.session, 'last_entry_time', dtime(15, 14)))
+            last_t = min(getattr(CONFIG.session, 'last_entry_time', dtime(15, 14)), cutoff_t)
+            # Guard: completed-bar only (closed_5m[-1] is closed), no entries before 09:20 context or at/after 15:15.
+            bar_t = closed_5m[-1].ts.time() if hasattr(closed_5m[-1].ts, 'time') else None
+            if CONFIG.session.enable_time_based_entry_gate:
+                if now_t < start_t or now_t > last_t:
+                    return
+                if bar_t is not None and bar_t >= dtime(15, 15):
+                    return
             allowed, adx_reason = self.risk.adx_band_allows(signal.adx)
             if not allowed:
                 _log.info("Entry blocked by ADX band: %s", adx_reason)
@@ -325,9 +395,50 @@ class TradingBot:
             vals.append(cum_pv / cum_vol)
         return vals
 
+    def _option_entry_filters(self, contract, premium: float) -> tuple[bool, str]:
+        """Anti-chase/option confirmation for a bought option. Returns (ok, reason)."""
+        if not (CONFIG.risk.anti_chase_enabled or CONFIG.risk.option_confirm_enabled):
+            return True, "OK"
+        try:
+            from_date = datetime.combine(datetime.now().date() - timedelta(days=2), dtime(9, 15))
+            to_date = datetime.now()
+            bars = self.kite.historical_data(contract.instrument_token, from_date, to_date, "5minute")
+            oc = [Candle(ts=(b["date"].replace(tzinfo=None) if hasattr(b["date"], "tzinfo") and b["date"].tzinfo else b["date"]),
+                         open=float(b["open"]), high=float(b["high"]), low=float(b["low"]), close=float(b["close"]),
+                         volume=int(b.get("volume", 0))) for b in (bars or [])]
+            if not oc:
+                return True, "OPTION_CANDLES_UNAVAILABLE"
+            c = oc[-1]
+            ep = premium if premium > 0 else c.close
+            if CONFIG.risk.anti_chase_enabled:
+                closes = [x.close for x in oc[-5:] if x.close > 0]
+                if closes:
+                    avg = sum(closes) / len(closes)
+                    if avg > 0 and ep > avg * (1 + CONFIG.risk.anti_chase_max_pct_above_recent_avg / 100.0):
+                        return False, f"ANTI_CHASE(premium={ep:.2f}>avg={avg:.2f})"
+                if CONFIG.risk.anti_chase_require_up_candle and not (c.close > c.open):
+                    return False, f"ANTI_CHASE_WEAK_CANDLE(o={c.open:.2f} c={c.close:.2f})"
+            if CONFIG.risk.option_confirm_enabled:
+                closes = [x.close for x in oc[-max(2, CONFIG.risk.option_confirm_ema_period):] if x.close > 0]
+                if closes:
+                    k = 2 / (len(closes) + 1)
+                    e = closes[0]
+                    for v in closes[1:]:
+                        e = v * k + e * (1 - k)
+                    if ep < e:
+                        return False, f"OPTION_CONFIRM_FAIL(premium={ep:.2f}<ema={e:.2f})"
+            return True, "OK"
+        except Exception:
+            _log.debug("Option candle filters unavailable for %s; proceeding", getattr(contract, "tradingsymbol", "?"))
+            return True, "OPTION_FILTERS_UNAVAILABLE"
+
     def _execute_signal(self, signal) -> None:
         if not self._check_margin_safety():
             _log.warning("Entry blocked due to low margin")
+            return
+        allowed, reason = self.risk.can_take_new_trade()
+        if not allowed:
+            _log.info("Entry blocked by risk guard: %s", reason)
             return
 
         try:
@@ -337,27 +448,33 @@ class TradingBot:
             _log.exception("Failed to resolve ATM contract for signal")
             return
 
+        ok, sym_reason = self.risk.can_enter_symbol(contract.tradingsymbol, strike=contract.strike, option_type=contract.option_type)
+        if not ok:
+            _log.info("ENTRY_SYMBOL_GUARD_SKIP | %s | %s", contract.tradingsymbol, sym_reason)
+            return
+
         premium = self._get_option_ltp(contract.tradingsymbol) or 0.0
+        if premium <= 0:
+            _log.warning("Entry skipped: option LTP unavailable for %s", contract.tradingsymbol)
+            return
+        fok, freason = self._option_entry_filters(contract, premium)
+        if not fok:
+            _log.info("ENTRY_OPTION_FILTER_SKIP | %s | %s", contract.tradingsymbol, freason)
+            return
         equity = self.risk.equity
 
-        # All distances are OPTION PREMIUM points, applied directly to the
-        # option's live premium. No index-to-premium conversion.
+        # Buy-only options (CE for bullish, PE for bearish): all distances are
+        # OPTION PREMIUM points on the bought option. Loss = premium falls by SL distance.
         sl_distance = abs(signal.entry_price - signal.stop_loss)
         target_distance = abs(signal.target - signal.entry_price)
-        if signal.side == TradeSide.LONG:
-            premium_sl = premium - sl_distance
-            premium_target = premium + target_distance
-        else:
-            premium_sl = premium + sl_distance
-            premium_target = premium - target_distance
-        premium_sl = max(premium_sl, 0.05)
-        premium_target = max(premium_target, 0.05)
+        premium_sl = max(premium - sl_distance, 0.05)
+        premium_target = max(premium + target_distance, 0.05)
 
         sizing = self.margin_mgr.size_position(
             equity=equity, entry_price=premium, stop_loss_price=premium_sl,
             option_premium=premium, lot_size=contract.lot_size,
             margin_per_lot_estimate=self._estimate_margin_per_lot(contract, premium),
-            adx=signal.adx,
+            adx=signal.adx, consecutive_losses=self.risk.stats.consecutive_losses,
         )
         if sizing.quantity <= 0:
             return
@@ -369,7 +486,11 @@ class TradingBot:
             initial_sl=sl_distance, entry_adx=signal.adx,
         )
         self._subscribe_active_option(contract.instrument_token)
-        send_telegram_alert("POSITION_OPEN", f"{contract.tradingsymbol} | Qty: {sizing.quantity} | Side: {signal.side.value} | Entry: ₹{premium:.2f} | SL: ₹{premium_sl:.2f} | Target: ₹{premium_target:.2f} | ADX: {signal.adx:.1f} | Lots: {sizing.lots}")
+        trade_num = self.risk.stats.trades_taken + 1
+        send_telegram_alert(
+            "POSITION_OPEN",
+            f"TRADE: {trade_num} | {contract.tradingsymbol} | Qty: {sizing.quantity} | Side: {signal.side.value} | Entry: ₹{premium:.2f} | SL: ₹{premium_sl:.2f} | Target: ₹{premium_target:.2f} | ADX: {signal.adx:.1f} | Lots: {sizing.lots}",
+        )
 
     def _estimate_margin_per_lot(self, contract, premium: float) -> float:
         # Buying options is fully paid (no leverage on the long premium side);
@@ -393,7 +514,10 @@ class TradingBot:
 
     def _on_position_exit(self, symbol: str, result) -> None:
         self._unsubscribe_active_option()
-        self.risk.record_trade_result(result.pnl)
+        pos = self.order_mgr.get_position(symbol) if hasattr(self.order_mgr, 'get_position') else None
+        strike = getattr(getattr(pos, 'contract', None), 'strike', None)
+        opt_type = getattr(getattr(pos, 'contract', None), 'option_type', None)
+        self.risk.record_trade_result(result.pnl, tradingsymbol=symbol, reason=getattr(result, 'reason', ''), strike=strike, option_type=opt_type)
         if CONFIG.mode != TradingMode.LIVE:
             self.risk.equity += result.pnl
             self.margin_mgr.update_paper_equity(self.risk.equity)
@@ -401,7 +525,8 @@ class TradingBot:
         total_trades = self.risk.stats.trades_taken
         win_rate = self.risk.win_rate()
         daily_pnl = self.risk.stats.realized_pnl
-        msg = f"{symbol} | PnL: ₹{result.pnl:.2f} | Reason: {result.reason} | Trades Today: {total_trades} | Daily PnL: ₹{daily_pnl:.2f} | WinRate: {win_rate:.1f}%"
+        mfe = getattr(getattr(self.order_mgr, '_last_exit_metrics', {}), 'get', lambda *_: None)('mfe') if False else ''
+        msg = f"{symbol} | PnL: ₹{result.pnl:.2f} | Reason: {getattr(result,'reason','')} | Trades Today: {total_trades} | Daily PnL: ₹{daily_pnl:.2f} | WinRate: {win_rate:.1f}%"
         send_telegram_alert("POSITION_CLOSE", msg)
         dashboard.update_state(
             position=None, current_pnl=0, daily_pnl=round(self.risk.stats.realized_pnl, 2),
@@ -568,24 +693,39 @@ class TradingBot:
     # DASHBOARD FEED
     # ------------------------------------------------------------
 
+    def _get_spot_ltp(self) -> float | None:
+        try:
+            q = self.kite.ltp([f"{CONFIG.instrument.exchange}:{'NIFTY 50'}"])
+            key = f"{CONFIG.instrument.exchange}:NIFTY 50"
+            return (q.get(key) or {}).get("last_price")
+        except Exception:
+            return None
+
     def _update_dashboard_indicators(self, closed_5m) -> None:
         closes = [c.close for c in closed_5m]
         ema20 = ind.latest_ema(closes, CONFIG.indicators.ema_fast)
         ema50 = ind.latest_ema(closes, CONFIG.indicators.ema_slow)
         adx_val = ind.adx(closed_5m, CONFIG.indicators.adx_period)
+        adx_kite_val = ind.adx(closed_5m, getattr(CONFIG.indicators, "adx_kite_period", 10))
         atr_val = ind.atr(closed_5m, CONFIG.indicators.atr_period)
         vwap = self.candles.get_current_vwap(self.spot_token, CONFIG.session.primary_timeframe_min)
         positions = self.order_mgr.get_open_positions()
         pos = positions[0] if positions else None
+        levels = getattr(self, "_market_levels", {}) or {}
+        live_spot = self._get_spot_ltp()
 
         dashboard.update_state(
-            nifty_spot=closes[-1] if closes else None,
+            nifty_spot=round(live_spot, 2) if live_spot else (closes[-1] if closes else None),
             trend=("UP" if ema20 and ema50 and ema20 > ema50 else "DOWN" if ema20 and ema50 else None),
             ema20=round(ema20, 2) if ema20 else None,
             ema50=round(ema50, 2) if ema50 else None,
             vwap=round(vwap, 2) if vwap else None,
             adx=round(adx_val, 2) if adx_val else None,
+            adx_kite=round(adx_kite_val, 2) if adx_kite_val else None,
             atr=round(atr_val, 2) if atr_val else None,
+            adr_14=levels.get("adr_14"),
+            pdh=levels.get("pdh"), pdl=levels.get("pdl"), pdc=levels.get("pdc"),
+            pivot=levels.get("pivot"), s1=levels.get("s1"), r1=levels.get("r1"),
             position=pos.contract.tradingsymbol if pos else None,
             entry_price=pos.entry_price if pos else None,
             atm_strike=pos.contract.strike if pos else None,
@@ -628,6 +768,17 @@ class TradingBot:
         log_decision("BOT_SHUTDOWN", trades_today=self.risk.stats.trades_taken,
                      daily_pnl=round(self.risk.stats.realized_pnl, 2))
         send_telegram_alert("BOT_SHUTDOWN", f"Trades={self.risk.stats.trades_taken} PnL={self.risk.stats.realized_pnl:.2f}")
+
+        # If a restart was requested, exit non-zero so the launchd
+        # supervisor (KeepAlive SuccessfulExit=false) relaunches main.py.
+        try:
+            from telegram_control import restart_requested, clear_restart
+            if restart_requested():
+                _log.info("Restart requested via Telegram - exiting for supervisor relaunch.")
+                clear_restart()
+                sys.exit(1)
+        except Exception:
+            _log.exception("restart check failed on shutdown")
         sys.exit(0)
 
 

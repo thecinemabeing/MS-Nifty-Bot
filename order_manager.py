@@ -30,6 +30,10 @@ class ExitResult:
     pnl: float = 0.0
     reason: str = ""
     exit_price: float = 0.0
+    strike: Optional[int] = None
+    option_type: Optional[str] = None
+    tradingsymbol: str = ""
+    entry_adx: float = 0.0
 
 
 class OrderManager:
@@ -42,6 +46,9 @@ class OrderManager:
         self._entry_order_ids: dict[str, str] = {}
         self._exit_order_ids: dict[str, str] = {}
         self._lock = threading.Lock()
+
+    def _is_paper_mode(self) -> bool:
+        return CONFIG.mode == TradingMode.PAPER
 
     def on_exit(self, callback: Callable[[str, ExitResult], None]) -> None:
         self._on_exit_callback = callback
@@ -208,58 +215,63 @@ class OrderManager:
         reason = ""
         exit_price = ltp
 
-        # Calculate profit
-        profit = (
-            ltp - position.entry_price
-            if position.side == TradeSide.LONG
-            else position.entry_price - ltp
-        )
+        # Bought option (CE/PE): profit when premium rises above entry
+        profit = ltp - position.entry_price
+        # MFE/MAE tracking for validation/paper analysis
+        position.max_favorable_excursion = max(getattr(position, 'max_favorable_excursion', 0.0) or 0.0, profit)
+        position.max_adverse_excursion = max(getattr(position, 'max_adverse_excursion', 0.0) or 0.0, -profit)
+        # Optional no-progress exit (disabled by default; path-validate before enabling)
+        if getattr(CONFIG.risk, 'no_progress_exit_enabled', False):
+            try:
+                mins = (datetime.now() - position.entry_time).total_seconds() / 60.0
+                if mins >= float(getattr(CONFIG.risk, 'no_progress_minutes', 10)) and position.max_favorable_excursion < float(getattr(CONFIG.risk, 'no_progress_min_profit_points', 3.0)):
+                    self._close_position(symbol, position, ltp, "NO_PROGRESS_EXIT")
+                    return
+            except Exception:
+                pass
 
-        # Single-step trailing: at +trail_trigger_premium_points, lock
-        # +trail_lock_premium_points. Both are OPTION PREMIUM points.
-        if (
-            CONFIG.trade_mgmt.enable_trailing_after_breakeven
-            and position.initial_sl > 0
-            and profit >= CONFIG.trade_mgmt.trail_trigger_premium_points
-        ):
-            lock = CONFIG.trade_mgmt.trail_lock_premium_points
-            if position.side == TradeSide.LONG:
-                new_sl_trigger = position.entry_price + lock
-            else:
-                new_sl_trigger = position.entry_price - lock
-
-            position.stop_loss = new_sl_trigger
-            position.trailing_sl_active = True
-            if position.sl_order_id:
-                threshold = CONFIG.trade_mgmt.sl_m_slippage_points
+        # Continuous trailing (premium points). Once profit reaches trail_start,
+        # lock = highest_favorable_profit - gap, floored at initial lock.
+        if CONFIG.trade_mgmt.enable_trailing_after_breakeven and position.initial_sl > 0:
+            start = getattr(CONFIG.trade_mgmt, "trail_start_premium_points", CONFIG.trade_mgmt.trail_trigger_premium_points)
+            initial_lock = getattr(CONFIG.trade_mgmt, "trail_initial_lock_premium_points", CONFIG.trade_mgmt.trail_lock_premium_points)
+            gap = getattr(CONFIG.trade_mgmt, "trail_gap_premium_points", 2.0)
+            # track highest favorable profit (persisted field; keep legacy attr for compatibility)
+            peak = max(getattr(position, "peak_profit", 0.0) or 0.0, getattr(position, "_peak_profit", 0.0) or 0.0)
+            if profit > peak:
+                peak = profit
+            position.peak_profit = peak
+            position._peak_profit = peak
+            if profit >= start and peak >= start:
+                lock_profit = max(initial_lock, peak - gap)
                 if position.side == TradeSide.LONG:
-                    if new_sl_trigger > position.last_sl_trigger + threshold:
-                        self._cancel_sl_order(symbol, position)
-                        self._place_sl_m_order(symbol, position, new_sl_trigger)
-                else:
-                    if new_sl_trigger < position.last_sl_trigger - threshold:
-                        self._cancel_sl_order(symbol, position)
-                        self._place_sl_m_order(symbol, position, new_sl_trigger)
+                    new_sl_trigger = position.entry_price + lock_profit
 
-        if position.side == TradeSide.LONG:
-            if ltp <= position.stop_loss:
-                self._cancel_sl_and_market_exit(symbol, position, "STOP_LOSS_TOUCH")
-                return
-        else:
-            if ltp >= position.stop_loss:
-                self._cancel_sl_and_market_exit(symbol, position, "STOP_LOSS_TOUCH")
-                return
+                improved = new_sl_trigger > position.stop_loss
+                if improved:
+                    position.stop_loss = new_sl_trigger
+                    position.trailing_sl_active = True
+                    _log.info(
+                        "TRAIL_LOCK_UPDATE | symbol=%s | profit=%.2f | peak=%.2f | lock_profit=%.2f | new_sl=%.2f",
+                        symbol, profit, peak, lock_profit, new_sl_trigger,
+                    )
+                    if position.sl_order_id:
+                        threshold = CONFIG.trade_mgmt.sl_m_slippage_points
+                        if new_sl_trigger > (position.last_sl_trigger or 0.0) + threshold:
+                            self._cancel_sl_order(symbol, position)
+                            self._place_sl_m_order(symbol, position, new_sl_trigger)
 
-        # Target reached - exit at market
-        if position.target > 0:
-            if position.side == TradeSide.LONG and ltp >= position.target:
-                should_exit = True
-                reason = "TARGET_REACHED"
-                exit_price = ltp
-            elif position.side == TradeSide.SHORT and ltp <= position.target:
-                should_exit = True
-                reason = "TARGET_REACHED"
-                exit_price = ltp
+        # Bought option: SL breached if premium falls to/below SL
+        if ltp <= position.stop_loss:
+            self._cancel_sl_and_market_exit(symbol, position, "STOP_LOSS_TOUCH")
+            return
+
+        # Fixed target exit only when explicitly enabled; otherwise continuous
+        # trailing manages profit-taking via SL.
+        if CONFIG.trade_mgmt.use_fixed_target_exit and position.target > 0 and ltp >= position.target:
+            should_exit = True
+            reason = "TARGET_REACHED"
+            exit_price = ltp
 
         if should_exit:
             self._close_position(symbol, position, exit_price, reason)
@@ -441,12 +453,12 @@ class OrderManager:
             if order_type == "SL-M":
                 _log.info(
                     "ORDER_REQUEST | symbol=%s transaction_type=%s quantity=%d order_type=SL-M trigger_price=%.2f product=%s exchange=%s caller=_place_sl_order",
-                    symbol, "SELL" if position.side == TradeSide.LONG else "BUY", position.quantity, sl_trigger, CONFIG.capital.product_type, CONFIG.instrument.option_exchange,
+                    symbol, "SELL", position.quantity, sl_trigger, CONFIG.capital.product_type, CONFIG.instrument.option_exchange,
                 )
                 sl_order_id = self.kite.place_order(
                     tradingsymbol=symbol,
                     exchange=CONFIG.instrument.option_exchange,
-                    transaction_type="SELL" if position.side == TradeSide.LONG else "BUY",
+                    transaction_type="SELL",
                     quantity=position.quantity,
                     product=CONFIG.capital.product_type,
                     order_type="SL-M",
@@ -455,12 +467,12 @@ class OrderManager:
             else:
                 _log.info(
                     "ORDER_REQUEST | symbol=%s transaction_type=%s quantity=%d order_type=SL price=%.2f trigger_price=%.2f product=%s exchange=%s caller=_place_sl_order",
-                    symbol, "SELL" if position.side == TradeSide.LONG else "BUY", position.quantity, sl_limit, sl_trigger, CONFIG.capital.product_type, CONFIG.instrument.option_exchange,
+                    symbol, "SELL", position.quantity, sl_limit, sl_trigger, CONFIG.capital.product_type, CONFIG.instrument.option_exchange,
                 )
                 sl_order_id = self.kite.place_order(
                     tradingsymbol=symbol,
                     exchange=CONFIG.instrument.option_exchange,
-                    transaction_type="SELL" if position.side == TradeSide.LONG else "BUY",
+                    transaction_type="SELL",
                     quantity=position.quantity,
                     product=CONFIG.capital.product_type,
                     order_type="SL",
@@ -495,7 +507,7 @@ class OrderManager:
                 order_id=position.sl_order_id,
                 tradingsymbol=symbol,
                 exchange=CONFIG.instrument.option_exchange,
-                transaction_type="SELL" if position.side == TradeSide.LONG else "BUY",
+                transaction_type="SELL",
                 quantity=position.quantity,
                 product=CONFIG.capital.product_type,
                 order_type=order_type,
@@ -519,7 +531,7 @@ class OrderManager:
             _log.exception("Failed to modify SL order for %s", symbol)
 
     def _place_sl_m_order(self, symbol: str, position: Position, trigger_price: float) -> None:
-        transaction_type = "SELL" if position.side == TradeSide.LONG else "BUY"
+        transaction_type = "SELL"
         try:
             _log.info(
                 "ORDER_REQUEST | symbol=%s transaction_type=%s quantity=%d order_type=SL-M trigger_price=%.2f product=%s exchange=%s caller=_place_sl_m_order",
@@ -613,7 +625,7 @@ class OrderManager:
                         _log.info("Exit already pending for %s order_id=%s", symbol, position.exit_order_id)
                         return
 
-            transaction_type = "SELL" if position.side == TradeSide.LONG else "BUY"
+            transaction_type = "SELL"
             buffer_pct = CONFIG.trade_mgmt.exit_limit_buffer_pct
             limit_price = round(
                 exit_price * (1 - buffer_pct) if position.side == TradeSide.LONG else exit_price * (1 + buffer_pct),
@@ -783,7 +795,9 @@ class OrderManager:
 
         exit_price = position.exit_avg_price if position.exit_avg_price > 0 else position.entry_price
         pnl = self._compute_pnl(position, exit_price)
-        result = ExitResult(pnl=pnl, reason=position.exit_reason or "CLOSED", exit_price=exit_price)
+        result = ExitResult(pnl=pnl, reason=position.exit_reason or "CLOSED", exit_price=exit_price,
+                            strike=getattr(position.contract, 'strike', None), option_type=getattr(position.contract, 'option_type', None),
+                            tradingsymbol=symbol, entry_adx=float(getattr(position, 'entry_adx', 0.0) or 0.0))
 
         with self._lock:
             self._positions.pop(symbol, None)
@@ -814,6 +828,8 @@ class OrderManager:
             lot_size=position.contract.lot_size,
             entry_time=position.entry_time.isoformat(),
             exit_time=datetime.now().isoformat(),
+            mfe_pts=round(getattr(position, 'max_favorable_excursion', 0.0) or 0.0, 2),
+            mae_pts=round(getattr(position, 'max_adverse_excursion', 0.0) or 0.0, 2),
         )
 
         if self._on_exit_callback:
@@ -1177,7 +1193,7 @@ class OrderManager:
     def _validate_sl_order(self, symbol: str, position: Position, details: dict) -> bool:
         """Validate the protective SL order. Returns True if OK (or not enough
         data to judge). Returns False if a repair was attempted."""
-        expected_txn = "SELL" if position.side == TradeSide.LONG else "BUY"
+        expected_txn = "SELL"
 
         if details.get("tradingsymbol") and details.get("tradingsymbol") != symbol:
             _log.warning("SL_WATCHDOG_REPAIR_REQUIRED | symbol=%s | reason=SL_WRONG_SYMBOL actual=%s", symbol, details.get("tradingsymbol"))
@@ -1229,7 +1245,7 @@ class OrderManager:
             orders = self.kite.orders() or []
         except Exception:
             return
-        sl_txn = "SELL" if position.side == TradeSide.LONG else "BUY"
+        sl_txn = "SELL"
         active = ("OPEN", "TRIGGER PENDING", "AMO MODIFIED", "ACCEPTED", "OPEN PENDING")
         for o in orders:
             if o.get("tradingsymbol") != symbol:
@@ -1295,7 +1311,7 @@ class OrderManager:
         self._fire_market_exit(symbol, position, f"SL_RECOVERY_{reason}")
 
     def _fire_market_exit(self, symbol: str, position: Position, reason: str) -> None:
-        transaction_type = "SELL" if position.side == TradeSide.LONG else "BUY"
+        transaction_type = "SELL"
         fill_price = 0.0
         if CONFIG.mode == TradingMode.PAPER:
             ltp = self._get_ltp(symbol) if self._get_ltp else None
@@ -1406,7 +1422,7 @@ class OrderManager:
             _log.warning("Cannot send MARKET fallback for %s: cannot send exit", symbol)
             return
 
-        transaction_type = "SELL" if position.side == TradeSide.LONG else "BUY"
+        transaction_type = "SELL"
         order_kwargs = dict(
             tradingsymbol=symbol,
             exchange=CONFIG.instrument.option_exchange,

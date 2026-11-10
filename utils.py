@@ -183,6 +183,9 @@ class Position:
     trailing_sl_active: bool = False
     finalized: bool = False
     highest_favorable_price: float = 0.0
+    peak_profit: float = 0.0
+    max_favorable_excursion: float = 0.0  # MFE in premium points (bought option)
+    max_adverse_excursion: float = 0.0    # MAE in premium points (bought option)
     sl_order_id: Optional[str] = None
     last_sl_trigger: float = 0.0
     sl_repair_count: int = 0

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import html
 import json
+import socket
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +11,7 @@ from pathlib import Path
 from config import CONFIG
 from logger import get_logger
 from indicators import ema_series, adx, atr
-from telegram_control import read_suggest_control
+from telegram_control import read_suggest_control, read_manual_suggest_control
 
 _log = get_logger("telegram_suggestions")
 
@@ -20,12 +23,39 @@ def _send_message(text):
     chat_id = CONFIG.alerting.telegram_chat_id
     if not token or not chat_id:
         return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    if text and len(text) > 4096:
+        text = text[:4090] + "\n..."
     payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url := f"https://api.telegram.org/bot{token}/sendMessage", data=payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        # Fallback: retry without HTML parse_mode (bad entities / 400)
+        try:
+            plain = html.unescape(text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", ""))
+            payload2 = json.dumps({"chat_id": chat_id, "text": plain[:4096]}).encode("utf-8")
+            req2 = urllib.request.Request(url, data=payload2, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req2, timeout=15) as resp:
+                _log.warning("send recovered after HTTP %s by stripping HTML", e.code)
+                return resp.status == 200
+        except Exception:
+            pass
+        desc = body
+        try:
+            desc = json.loads(body).get("description") or body
+        except Exception:
+            pass
+        _log.warning("send failed: HTTP %s %s", e.code, desc)
+        return False
+    except (TimeoutError, socket.timeout):
+        _log.warning("send failed: timeout")
+        return False
     except Exception as e:
         _log.warning("send failed: %s", e)
         return False
@@ -78,7 +108,29 @@ class TradeSuggestionBot:
             msg.append(f"<b>🔍 TRADE SUGGESTION - {datetime.now().strftime('%H:%M:%S')}</b>")
             msg.append(f"NIFTY: {price:.2f} | Trend: {trend}")
             msg.append(f"EMA20: {ema20_val:.2f} | EMA50: {ema50_val:.2f}")
-            msg.append(f"ADX: {adx_val:.1f} if adx_val else 'N/A' | ATR: {atr_val:.1f} if atr_val else 'N/A'")
+            adx_s = f"{adx_val:.1f}" if adx_val is not None else "N/A"
+            atr_s = f"{atr_val:.1f}" if atr_val is not None else "N/A"
+            msg.append(f"ADX: {adx_s} | ATR: {atr_s}")
+
+            # qty based on available margin (paper/live)
+            est_premium = price * 0.0065 if price > 1000 else price  # rough ATM premium if spot passed; overridden below if option premium known
+            try:
+                est_premium = price  # suggestion uses NIFTY price context only; keep conservative via margin calc below
+            except Exception:
+                pass
+            lot_size = 65
+            try:
+                from margin_manager import MarginManager
+                mm = MarginManager(self.kite, paper_equity_override=CONFIG.backtest.starting_equity if CONFIG.mode.value!="LIVE" else None)
+                avail = mm.get_available_margin()
+            except Exception:
+                avail = 20000.0
+            usable = max(avail - CONFIG.capital.min_margin_buffer_rupees, 0.0) * CONFIG.capital.max_exposure_pct_of_margin
+            # estimate option premium ~1% of spot for sizing hint; actual premium shown at execution
+            prem_guess = max(price * 0.007, 50.0) if price > 1000 else max(price, 50.0)
+            lots_margin = int(usable // (prem_guess * lot_size)) if prem_guess*lot_size>0 else 0
+            lots_margin = min(max(lots_margin, 0), CONFIG.sizing.max_lots_per_trade)
+            msg.append(f"Available margin: ₹{avail:,.0f} | Max lots (est): {lots_margin}")
             msg.append("")
 
             if adx_val and adx_val >= 23 and adx_val <= 32:
@@ -86,14 +138,14 @@ class TradeSuggestionBot:
                     msg.append("<b>✅ SETUP MATCHING - LONG (CE)</b>")
                     msg.append(f"Entry Zone: ~{price:.2f}")
                     msg.append(f"SL: {price - 10:.2f} | Target: {price + 10:.2f}")
-                    msg.append(f"Qty Suggestion: 17 lots (ADX {adx_val:.1f})")
-                    msg.append("Type /auto to enable auto-trading or /stop to disable")
+                    msg.append(f"Qty Suggestion: {lots_margin} lot(s) (max by ₹{avail:,.0f} margin, ADX {adx_val:.1f})")
+                    msg.append("Type /autosuggest to enable auto suggestions or /stop to disable trading")
                 elif trend == "BEARISH" and price <= ema20_val + 35:
                     msg.append("<b>✅ SETUP MATCHING - SHORT (PE)</b>")
                     msg.append(f"Entry Zone: ~{price:.2f}")
                     msg.append(f"SL: {price + 10:.2f} | Target: {price - 10:.2f}")
-                    msg.append(f"Qty Suggestion: 17 lots (ADX {adx_val:.1f})")
-                    msg.append("Type /auto to enable auto-trading or /stop to disable")
+                    msg.append(f"Qty Suggestion: {lots_margin} lot(s) (max by ₹{avail:,.0f} margin, ADX {adx_val:.1f})")
+                    msg.append("Type /autosuggest to enable auto suggestions or /stop to disable trading")
                 else:
                     msg.append("⏳ Setup forming - Waiting for pullback near EMA20")
             elif adx_val and adx_val < 23:

@@ -13,3 +13,11 @@ download_data.py
 run_*.py
 validate_*.py
 .env
+
+# Local deployment secrets (NEVER share)
+railway_vars.txt
+regen_token.sh
+get_access.py
+auto_token.py
+
+.kilo/

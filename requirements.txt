@@ -5,3 +5,4 @@ logzero>=1.7.0
 websocket-client>=1.8.0
 python-dotenv>=1.0.0
 reportlab>=4.0.0
+flask>=3.0.0

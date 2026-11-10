@@ -118,13 +118,17 @@ def log_structured(event: str, **fields: Any) -> None:
 def send_telegram_alert(event: str, message: str) -> None:
     if not CONFIG.alerting.enabled:
         return
+    token = CONFIG.alerting.telegram_bot_token
+    chat_id = CONFIG.alerting.telegram_chat_id
+    if not token or not chat_id:
+        return
     text = f"[NIFTY Bot] {event}: {message}"
-    url = f"https://api.telegram.org/bot{CONFIG.alerting.telegram_bot_token}/sendMessage"
-    payload = json.dumps({"chat_id": CONFIG.alerting.telegram_chat_id, "text": text}).encode("utf-8")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status != 200:
-                _log.warning("Telegram alert failed: HTTP %d", resp.status)
+                logging.getLogger("nifty_bot").warning("Telegram alert failed: HTTP %d", resp.status)
     except Exception as exc:
-        _log.warning("Telegram alert failed: %s", exc)
+        logging.getLogger("nifty_bot").warning("Telegram alert failed: %s", exc)

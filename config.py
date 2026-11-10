@@ -48,6 +48,7 @@ class KiteConfig:
     request_token: str = os.getenv("KITE_REQUEST_TOKEN", "")
     user_id: str = os.getenv("KITE_USER_ID", os.getenv("ANGELONE_CLIENT_CODE", ""))
     password: str = os.getenv("KITE_PASSWORD", os.getenv("ANGELONE_PASSWORD", ""))
+    redirect_url: str = os.getenv("KITE_REDIRECT_URL", "")
     tokens_path: Path = Path.home() / ".nifty_bot" / "kite_tokens.json"
 
     request_timeout_sec: float = 8.0
@@ -85,7 +86,7 @@ class AngelOneConfig:
 
 @dataclass(frozen=True)
 class CapitalConfig:
-    configured_capital: float = 20000.0   # 20k base capital
+    configured_capital: float = 30000.0   # 30k base capital
     product_type: str = "MIS"               # intraday only
     max_exposure_pct_of_margin: float = 0.90  # never use more than 90% of
                                                # available margin on one trade
@@ -116,14 +117,16 @@ class InstrumentConfig:
 @dataclass(frozen=True)
 class SessionConfig:
     market_open: time = time(9, 15)
-    warm_up_until: time = time(9, 15)        # no warm-up delay
-    setup_scan_start: time = time(9, 15)     # start scanning immediately
-    last_entry_time: time = time(15, 15)     # allow entries until 15:15
-    force_square_off_time: time = time(15, 15)
+    warm_up_until: time = time(9, 15)
+    # First actionable signal is the close of the 09:15-09:20 bar; earliest fill is 09:20 bar open.
+    setup_scan_start: time = time(9, 20)
+    # No new entries at or after 15:15 (keeps time for exit before 15:30 sq-off).
+    entry_cutoff_time: time = time(15, 14)
+    last_entry_time: time = time(15, 14)
+    force_square_off_time: time = time(15, 30)
     market_close: time = time(15, 30)
 
-    # No session gating: the bot may enter at any time inside the trading window.
-    enable_time_based_entry_gate: bool = False
+    enable_time_based_entry_gate: bool = True
 
     primary_timeframe_min: int = 5
     higher_timeframe_min: int = 15
@@ -144,6 +147,7 @@ class IndicatorConfig:
     htf_ema_fast: int = 20
     htf_ema_slow: int = 50
     adx_period: int = 14
+    adx_kite_period: int = 10   # Kite chart-style ADX period (for display/comparison only)
     atr_period: int = 14
     vwap_reset_daily: bool = True
     volume_lookback: int = 1                # compare current vs previous candle
@@ -155,32 +159,26 @@ class IndicatorConfig:
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    # ADX eligibility: every trade independently needs ADX inside this band.
-    # There is no comparison against the previous trade, so ADX may fall
-    # between trades and return to the same band. Example: trade 1 at 23,
-    # ADX drops to 21 (blocked), returns to 23 -> trade 2 is eligible.
-    adx_min: float = 23.0                    # trend must be at least this strong
-    atr_min_points: float = 10.0             # minimum NIFTY-points ATR to trade;
-                                                   # below this = too quiet, skip
-    adx_max: float = 32.0                    # no entries once ADX is above this
-    ema_flat_slope_lookback: int = 5        # bars used to judge "EMA is flat"
-    ema_flat_slope_min_points: float = 1.5  # min EMA20 movement over lookback
-                                                   # bars to NOT be considered flat
+    # V1 band: eligible when ADX >= 23.0 and <= 32.0
+    adx_min: float = 23.0
+    adx_max: float = 32.0
+    atr_min_points: float = 10.0
+    ema_flat_slope_lookback: int = 5
+    ema_flat_slope_min_points: float = 1.5
 
     pullback_max_distance_from_ema20_points: float = 35.0
     vwap_cross_lookback_bars: int = 10
-    vwap_max_crosses_allowed: int = 10      # more than this in lookback = choppy, skip
+    vwap_max_crosses_allowed: int = 10
 
-    gap_max_pct: float = 3.0                # skip day if opening gap > this %
+    gap_max_pct: float = 3.0
 
     # confirmation candle
-    strong_candle_body_to_range_min_pct: float = 0.25  # body >=25% of candle range
-                                                           # to count as "strong"
+    strong_candle_body_to_range_min_pct: float = 0.25
 
-    # Only 2 trades per day allowed
-    max_trades_per_day: int = 2
+    # Max trades per day
+    max_trades_per_day: int = 10
 
-    manual_event_disable: bool = False      # flip True on RBI policy / budget days etc.
+    manual_event_disable: bool = False
 
 
 # ============================================================
@@ -204,13 +202,17 @@ class TradeManagementConfig:
     target_index_points: float = 10.0
     stop_loss_index_points_cap: float = 3.0   # SL = min(swing_sl, this)
 
-    # Single-step trailing: once profit reaches trail_trigger_premium_points,
-    # the SL is moved to lock trail_lock_premium_points of profit.
-    # Measured on the OPTION PREMIUM, since that is what we trade.
+    # Continuous trailing (premium points): after trail_start profit, lock
+    # (highest_profit - trail_gap). Step applies on every trail_step gain.
+    # Example (rule 1): +10 -> lock +8, then every +2 keep SL 2 pts below high.
     enable_trailing_after_breakeven: bool = True
-    trail_trigger_premium_points: float = 7.0
-    trail_lock_premium_points: float = 5.0
-    trail_step_index_points: float = 2.0       # legacy, unused
+    trail_start_premium_points: float = 10.0
+    trail_initial_lock_premium_points: float = 8.0
+    trail_gap_premium_points: float = 2.0
+    trail_step_premium_points: float = 2.0
+    trail_trigger_premium_points: float = 10.0   # legacy alias
+    trail_lock_premium_points: float = 8.0      # legacy alias
+    trail_step_index_points: float = 2.0         # legacy, unused
 
     sl_order_type: str = "SL-M"                # stop-market for guaranteed fill in live
     sl_limit_offset_points: float = 2.0         # limit price = trigger +/- this
@@ -228,15 +230,11 @@ class TradeManagementConfig:
     use_sl_m_after_trail: bool = True           # use SL-M instead of SL-Limit after trail starts
     sl_m_slippage_points: float = 0.5           # expected slippage on SL-M fills
 
-    # Fixed SL/Target mode (overrides swing-based 1:2 RR)
-    #
-    # Trade path, in OPTION PREMIUM points from entry (long CE example):
-    #   entry 100.00 -> SL sits at 93.00   (7 points of risk)
-    #   +7     107.00 -> trailing engages, SL moves to 105.00 (locks 5)
-    #   +10    110.00 -> target reached, position closed
+    # V1: fixed initial SL; winners managed by continuous trailing (no fixed target exit)
     use_fixed_sl_target: bool = True
-    fixed_sl_premium_points: float = 10.0        # SL = entry -/+ 10 premium points
-    fixed_target_premium_points: float = 10.0   # target = entry +/+ 10 premium points
+    use_fixed_target_exit: bool = False
+    fixed_sl_premium_points: float = 10.0        # SL = entry - 10 premium points
+    fixed_target_premium_points: float = 10.0    # reference distance; target exit off
 
 
 # ============================================================
@@ -245,9 +243,13 @@ class TradeManagementConfig:
 
 @dataclass(frozen=True)
 class PositionSizingConfig:
-    risk_per_trade_pct_of_equity: float = 5.0   # % of account equity risked per trade
-    max_lots_per_trade: int = 27                 # hard ceiling regardless of margin (~2L at ~112 premium)
-    round_lots_down: bool = True                  # never round up quantity
+    risk_per_trade_pct_of_equity: float = 5.0
+    max_lots_per_trade: int = 27
+    max_premium_exposure_pct_of_equity: float = 100.0  # V1: no equity premium exposure cap
+    drop_lots_after_consecutive_losses: int = 0       # V1
+    lots_drop_per_consecutive_loss_step: int = 1
+    min_lots_after_loss_reduction: int = 1
+    round_lots_down: bool = True
 
 
 # ============================================================
@@ -256,10 +258,29 @@ class PositionSizingConfig:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    daily_loss_limit_pct_of_equity: float = 5.0  # Allow more room for ₹20k
+    daily_loss_limit_pct_of_equity: float = 5.0
     daily_profit_target_pct_of_equity: float = 10.0
     stop_after_daily_loss_limit: bool = False
     stop_after_daily_profit_target: bool = False
+    # Targeted guards (keep opportunity; remove known loss patterns)
+    enable_entry_protection_guards: bool = False
+    cooldown_after_sl_sec: int = 15 * 60
+    same_contract_cooldown_sec: int = 15 * 60  # blocks rapid re-entry (loss #8 pattern)
+    consecutive_loss_pause_count: int = 2
+    consecutive_loss_pause_sec: int = 30 * 60
+    max_daily_losses: int = 4
+    max_daily_loss_rupees: float = 0.0
+    anti_chase_enabled: bool = False
+    anti_chase_max_pct_above_recent_avg: float = 5.0
+    anti_chase_require_up_candle: bool = True
+    option_confirm_enabled: bool = False
+    option_confirm_ema_period: int = 3
+    no_progress_exit_enabled: bool = False
+    no_progress_min_profit_points: float = 3.0
+    no_progress_minutes: int = 10
+    # Opening window: cap to 1 lot until strategy proves open (loss #5/#9 pattern)
+    opening_window_end: time = time(9, 30)
+    opening_window_max_lots: int = 1
 
 
 # ============================================================
@@ -299,7 +320,7 @@ class LoggingConfig:
 @dataclass(frozen=True)
 class DashboardConfig:
     host: str = "127.0.0.1"
-    port: int = 8765
+    port: int = 8767
     refresh_interval_sec: float = 2.0
 
 
@@ -311,7 +332,7 @@ class DashboardConfig:
 class BacktestConfig:
     data_dir: Path = Path.home() / ".nifty_bot" / "backtest_data"
     results_dir: Path = Path.home() / ".nifty_bot" / "backtest_results"
-    starting_equity: float = 20000.0  # Paper trading capital for ₹20,000
+    starting_equity: float = 30000.0  # Paper trading capital for ₹30,000
     commission_per_lot: float = 40.0        # round-trip brokerage + charges estimate
     slippage_points: float = 0.5            # applied to entries/exits in backtest
 

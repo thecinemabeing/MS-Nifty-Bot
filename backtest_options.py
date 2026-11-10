@@ -35,7 +35,7 @@ from typing import Optional
 
 from config import CONFIG
 from indicators import ema_series
-from angelone_api import AngelOneAPI
+from kite_api import KiteAPI
 from logger import get_logger
 from option_selector import OptionUniverse
 from risk_manager import RiskManager
@@ -108,7 +108,7 @@ class DayResult:
 # ---------------------------------------------------------------------------
 
 class OptionBacktestEngine:
-    def __init__(self, kite: AngelOneAPI, starting_equity: float) -> None:
+    def __init__(self, kite: KiteAPI, starting_equity: float) -> None:
         self.kite = kite
         self.equity = starting_equity
         self.starting_equity = starting_equity
@@ -729,7 +729,7 @@ def main() -> None:
     print(f"Mode: BUY options only (CE for LONG, PE for SHORT)")
     print("=" * 60)
 
-    kite = AngelOneAPI()
+    kite = KiteAPI()
     kite.login()
 
     end_date = date.today()
