@@ -8,6 +8,7 @@ venv/
 .venv/
 *.log
 *.jsonl
+*.json
 reports/
 download_data.py
 run_*.py

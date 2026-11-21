@@ -100,17 +100,19 @@ class RiskManager:
         return True, "OK"
 
     def can_enter_symbol(self, tradingsymbol: str, strike: Optional[int] = None, option_type: Optional[str] = None) -> tuple[bool, str]:
-        if not CONFIG.risk.enable_entry_protection_guards:
-            return True, "OK"
+        # Same-contract cooldown is ALWAYS enforced when configured (it is the
+        # mechanism that stops churn like today's 3x 25300CE in 40 min). It does
+        # not depend on the broader entry-protection guard flag.
         key = f"{tradingsymbol}|{strike or ''}|{option_type or ''}"
         cooldown = self._cooldowns.get(key) or self._cooldowns.get(tradingsymbol)
-        if not cooldown:
+        if cooldown:
+            now = self._now_ts()
+            if now < cooldown.until_ts:
+                remaining = int(cooldown.until_ts - now)
+                return False, f"{cooldown.reason}({remaining}s)"
             return True, "OK"
-        now = self._now_ts()
-        if now < cooldown.until_ts:
-            remaining = int(cooldown.until_ts - now)
-            return False, f"{cooldown.reason}({remaining}s)"
-        return True, "OK"
+        if not CONFIG.risk.enable_entry_protection_guards:
+            return True, "OK"
 
     def record_trade_result(self, pnl: float, tradingsymbol: str = "", reason: str = "", strike: Optional[int] = None, option_type: Optional[str] = None) -> None:
         trade_num = self.stats.trades_taken + 1
@@ -131,12 +133,10 @@ class RiskManager:
             self.stats.consecutive_losses = 0
 
         # Targeted 15-min same-contract cooldown: blocks rapid re-entry after SL/fast loss (#8 pattern).
+        # Always enforced when configured — independent of the broader guard flag.
         sec = int(getattr(CONFIG.risk, "same_contract_cooldown_sec", 0) or 0)
-        is_loss_exit = pnl < 0 and ("SL" in (reason or "").upper() or "STOP_LOSS" in (reason or "").upper() or "FORCE" not in (reason or "").upper() or sec > 0)
-        if CONFIG.risk.enable_entry_protection_guards:
-            sec = sec or int(CONFIG.risk.cooldown_after_sl_sec or 0)
-            is_loss_exit = pnl < 0 and ("SL" in (reason or "").upper() or "STOP_LOSS" in (reason or "").upper())
-        if sec > 0 and tradingsymbol and (pnl < 0):
+        is_sl_loss = pnl < 0 and ("SL" in (reason or "").upper() or "STOP_LOSS" in (reason or "").upper())
+        if sec > 0 and tradingsymbol and is_sl_loss:
             now = self._now_ts()
             cooldown = _SymbolCooldown(until_ts=now + sec, reason="SAME_CONTRACT_COOLDOWN", strike=strike, option_type=option_type)
             self._cooldowns[tradingsymbol] = cooldown

@@ -50,6 +50,7 @@ _LABELS = {
     "trades_today": "Trades Today",
     "win_rate": "Win Rate",
     "mode": "Mode",
+    "tick_count": "Ticks Received",
 }
 
 

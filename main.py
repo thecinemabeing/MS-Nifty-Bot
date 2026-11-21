@@ -96,9 +96,19 @@ class TradingBot:
 
         try:
             self.kite.login()
-        except Exception:
-            _log.exception("Kite login failed - aborting")
-            return
+            self._kite_ok = True
+        except Exception as exc:
+            # Kite login failed (expired token). Keep the bot running in degraded
+            # mode so the Telegram listener stays alive and can accept /login +
+            # /token to refresh the token. Trading is blocked until login succeeds.
+            self._kite_ok = False
+            _log.error("Kite login failed - bot running degraded (Telegram commands still work): %s", exc)
+            send_telegram_alert(
+                "KITE_LOGIN_FAILED",
+                f"⚠️ Kite login failed: {exc}\n"
+                "Send /login to get the Kite login URL, then /token <request_token> to refresh.\n"
+                "Trading is blocked until login succeeds.",
+            )
 
         if CONFIG.mode == TradingMode.LIVE:
             margin = self.margin_mgr.get_available_margin()
@@ -106,13 +116,18 @@ class TradingBot:
             self.risk._starting_equity = margin
             _log.info("Live equity initialized from broker margin: Rs.%.2f", margin)
 
-        try:
+        # Pre-flight profile check (skipped in degraded mode - no valid token yet).
+        if self._kite_ok:
+            try:
+                profile = {}
+                profile = self.kite.profile()
+                account_name = profile.get("name") or profile.get("clientcode") or "unknown"
+                _log.info("Pre-flight: user=%s margin=%.2f", account_name, margin if CONFIG.mode == TradingMode.LIVE else 0.0)
+            except Exception:
+                _log.warning("Pre-flight profile check failed - continuing")
+        else:
             profile = {}
-            profile = self.kite.profile()
-            account_name = profile.get("name") or profile.get("clientcode") or "unknown"
-            _log.info("Pre-flight: user=%s margin=%.2f", account_name, margin if CONFIG.mode == TradingMode.LIVE else 0.0)
-        except Exception:
-            _log.warning("Pre-flight profile check failed - continuing")
+            _log.warning("Pre-flight skipped - Kite not authenticated (degraded mode)")
 
         send_telegram_alert("BOT_START", f"Mode={CONFIG.mode.value} user={profile.get('name') or profile.get('clientcode') or 'unknown'}")
 
@@ -133,23 +148,29 @@ class TradingBot:
         except Exception:
             _log.exception("rebuild_today_from_journal failed")
 
-        self.spot_token = self.option_universe.get_spot_instrument_token()
-        self._warm_up_history()
+        # Warm-up / spot token require live Kite data - skip in degraded mode.
+        # NOTE: threads (incl. Telegram listener) are started below regardless,
+        # so the bot stays alive and can accept /login + /token to recover.
+        if not self._kite_ok:
+            _log.warning("Degraded mode: skipping history warm-up and ticker until Kite login succeeds")
+        else:
+            self.spot_token = self.option_universe.get_spot_instrument_token()
+            self._warm_up_history()
 
-        # Push rebuilt counters to the dashboard immediately (the scan
-        # loop only updates state while the market is open).
-        try:
-            self._update_dashboard_indicators(
-                self.candles.get_closed_candles(self.spot_token, CONFIG.session.primary_timeframe_min)
-                or []
-            )
-        except Exception:
-            _log.exception("initial dashboard update failed")
+            # Push rebuilt counters to the dashboard immediately (the scan
+            # loop only updates state while the market is open).
+            try:
+                self._update_dashboard_indicators(
+                    self.candles.get_closed_candles(self.spot_token, CONFIG.session.primary_timeframe_min)
+                    or []
+                )
+            except Exception:
+                _log.exception("initial dashboard update failed")
 
-        tokens = [self.spot_token]
-        self.kite.start_ticker(tokens, on_tick=self._on_ticks)
-        if not self.kite.wait_until_connected(timeout=20):
-            _log.error("WebSocket failed to connect within timeout - retrying in background.")
+            tokens = [self.spot_token]
+            self.kite.start_ticker(tokens, on_tick=self._on_ticks)
+            if not self.kite.wait_until_connected(timeout=20):
+                _log.error("WebSocket failed to connect within timeout - retrying in background.")
 
         gap_thread = threading.Thread(target=self._ws_gap_recovery_loop, daemon=True)
         gap_thread.start()
@@ -173,6 +194,13 @@ class TradingBot:
         ctrl_thread = threading.Thread(target=start_control_loop, daemon=True)
         ctrl_thread.start()
         _log.info("Telegram control enabled - use /start, /stop, /status from your bot")
+
+        # In degraded mode, skip the scan loop's market logic but keep the
+        # process alive so Telegram commands work and login can be retried.
+        if not self._kite_ok:
+            _log.warning("Running degraded - send /login then /token <request_token> to recover")
+            self._main_scan_loop()
+            return
 
         self.suggestion_bot = TradeSuggestionBot(self.kite, self.candles, self.strategy)
         self.suggestion_bot.spot_token = None
@@ -273,14 +301,45 @@ class TradingBot:
 
     def _main_scan_loop(self) -> None:
         last_processed_bar_ts = None
+        login_retry_counter = 0
         while not _shutdown.is_set():
             try:
+                # In degraded mode, periodically retry Kite login so the bot
+                # auto-recovers once /token refreshes the access token.
+                if not getattr(self, "_kite_ok", True):
+                    login_retry_counter += 1
+                    if login_retry_counter % 5 == 0:
+                        try:
+                            self.kite.login()
+                            self._kite_ok = True
+                            _log.info("Kite login recovered - resuming normal operation")
+                            self._recover_live_components()
+                        except Exception:
+                            _log.debug("Kite login retry still failing (degraded mode)")
                 self._scan_iteration_guard(last_processed_bar_ts)
             except Exception:
                 _log.exception("Unhandled error in scan loop iteration - continuing.")
             _time.sleep(CONFIG.session.scan_loop_interval_sec)
 
         self._shutdown_sequence()
+
+    def _recover_live_components(self) -> None:
+        """Start ticker + warm-up after a degraded-mode Kite login recovery."""
+        try:
+            self.spot_token = self.option_universe.get_spot_instrument_token()
+            self._warm_up_history()
+            try:
+                self._update_dashboard_indicators(
+                    self.candles.get_closed_candles(self.spot_token, CONFIG.session.primary_timeframe_min)
+                    or []
+                )
+            except Exception:
+                _log.exception("post-recovery dashboard update failed")
+            tokens = [self.spot_token]
+            self.kite.start_ticker(tokens, on_tick=self._on_ticks)
+            _log.info("Recovery: ticker started for %d tokens", len(tokens))
+        except Exception:
+            _log.exception("live component recovery failed")
 
     def _scan_iteration_guard(self, last_processed_bar_ts) -> None:
         ctrl = read_control()
@@ -734,6 +793,7 @@ class TradingBot:
             trades_today=self.risk.stats.trades_taken,
             daily_pnl=round(self.risk.stats.realized_pnl, 2),
             win_rate=round(self.risk.win_rate(), 1),
+            tick_count=getattr(self, "_tick_count", 0),
         )
 
     # ------------------------------------------------------------

@@ -591,11 +591,11 @@ class KiteAPI:
         self._ws_connected.clear()
         _log.warning("WebSocket closed: code=%s reason=%s", code, reason)
 
-    def _on_ws_reconnect(self, ws, code, reason):
-        _log.info("WebSocket reconnecting: code=%s reason=%s", code, reason)
+    def _on_ws_reconnect(self, ws, attempts_count):
+        _log.info("WebSocket reconnecting: attempts=%s", attempts_count)
 
-    def _on_ws_noreconnect(self, code, reason):
-        _log.error("WebSocket gave up reconnecting: code=%s reason=%s", code, reason)
+    def _on_ws_noreconnect(self, attempts_count):
+        _log.error("WebSocket gave up reconnecting: attempts=%s", attempts_count)
 
     def wait_until_connected(self, timeout: int = 20) -> bool:
         return self._ws_connected.wait(timeout=timeout)

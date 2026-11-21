@@ -162,6 +162,15 @@ class StrategyConfig:
     # V1 band: eligible when ADX >= 23.0 and <= 32.0
     adx_min: float = 23.0
     adx_max: float = 32.0
+    # V2 overrides (applied by versions/v2/ replay script via object.__setattr__
+    # before importing the V2 strategy/risk modules). Kept here as documentation.
+    adx_rising_min_delta: float = 0.4
+    require_rising_adx: bool = False
+    trend_alignment_required: bool = False
+    chop_filter_enabled: bool = False
+    chop_start: time = time(11, 30)
+    chop_end: time = time(13, 15)
+    chop_adx_threshold: float = 28.0
     atr_min_points: float = 10.0
     ema_flat_slope_lookback: int = 5
     ema_flat_slope_min_points: float = 1.5
@@ -202,6 +211,12 @@ class TradeManagementConfig:
     target_index_points: float = 10.0
     stop_loss_index_points_cap: float = 3.0   # SL = min(swing_sl, this)
 
+    # ---- V2: ATR-based dynamic stop loss (applied by versions/v2/ replay) ----
+    # SL = max(min_sl_points, atr * atr_multiplier), target = sl * 2 (1:2 R:R).
+    use_atr_stop_loss: bool = False
+    atr_sl_multiplier: float = 1.5
+    min_sl_points: float = 15.0
+
     # Continuous trailing (premium points): after trail_start profit, lock
     # (highest_profit - trail_gap). Step applies on every trail_step gain.
     # Example (rule 1): +10 -> lock +8, then every +2 keep SL 2 pts below high.
@@ -235,6 +250,13 @@ class TradeManagementConfig:
     use_fixed_target_exit: bool = False
     fixed_sl_premium_points: float = 10.0        # SL = entry - 10 premium points
     fixed_target_premium_points: float = 10.0    # reference distance; target exit off
+
+    # ---- Profit ladder (Option A: walk target up, walk SL up behind it) ----
+    # OFF by default — V1 continuous trailing is the profit-taking mechanism.
+    # Enable only to ladder targets instead of trailing.
+    enable_profit_ladder: bool = False
+    ladder_target_step_premium_points: float = 10.0   # next target = current + 10
+    ladder_sl_below_target_premium_points: float = 2.0  # SL = last target hit - 2
 
 
 # ============================================================

@@ -152,10 +152,11 @@ class StrategyEngine:
                 sl_distance = stop_loss - entry_price
                 target_distance = sl_distance * 2
 
-            # Distances are OPTION PREMIUM points, applied to the index levels
-            # as a placeholder; main.py rebuilds the real premium prices.
-            stop_loss = entry_price + sl_distance
-            target = entry_price - target_distance
+            # Long PE buy (buy-only strategy). Distances are OPTION PREMIUM
+            # points on the BOUGHT option: profit when premium rises, loss when
+            # it falls. SL is BELOW entry, target ABOVE — same shape as CE.
+            stop_loss = entry_price - sl_distance
+            target = entry_price + target_distance
 
             return Signal(
                 side=TradeSide.SHORT,

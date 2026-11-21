@@ -81,7 +81,9 @@ class OrderManager:
             _log.warning("Cannot enter %s — LTP is 0 or unavailable", contract.tradingsymbol)
             return
 
-        transaction_type = "BUY" if side == TradeSide.LONG else "SELL"
+        # Buy-only strategy: both CE (bullish) and PE (bearish) are BOUGHT.
+        # A long PE profits when its premium rises (Nifty falls). Never sell.
+        transaction_type = "BUY"
 
         position = Position(
             contract=contract,
@@ -230,9 +232,50 @@ class OrderManager:
             except Exception:
                 pass
 
+        # ---- Profit ladder (Option A): walk target up +10, walk SL up 2 below target ----
+        # Targets are fixed levels above entry: entry+10, entry+20, entry+30...
+        # Each target hit moves the SL to (last_target_hit - sl_below), so profit is
+        # "banked" by walking the stop up. Exit only on SL breach or 15:30 square-off.
+        # Applies to every bought option (CE and PE are both long buys).
+        if CONFIG.trade_mgmt.enable_profit_ladder:
+            step = CONFIG.trade_mgmt.ladder_target_step_premium_points
+            sl_below = CONFIG.trade_mgmt.ladder_sl_below_target_premium_points
+            if not position.ladder_active:
+                position.ladder_active = True
+                position.ladder_target = position.entry_price + step
+                position.ladder_last_target_hit = position.entry_price
+                _log.info("LADDER_START | symbol=%s | entry=%.2f | first_target=%.2f | sl_below=%.1f",
+                          symbol, position.entry_price, position.ladder_target, sl_below)
+            if profit >= 0 and ltp >= position.ladder_target:
+                hit = position.ladder_target
+                position.ladder_last_target_hit = hit
+                position.ladder_target = hit + step
+                new_sl = hit - sl_below
+                if new_sl > position.stop_loss:
+                    position.stop_loss = new_sl
+                    position.trailing_sl_active = True
+                    _log.info(
+                        "LADDER_STEP | symbol=%s | target_hit=%.2f | next_target=%.2f | new_sl=%.2f | profit=%.2f",
+                        symbol, hit, position.ladder_target, new_sl, profit,
+                    )
+                    if position.sl_order_id:
+                        threshold = CONFIG.trade_mgmt.sl_m_slippage_points
+                        if new_sl > (position.last_sl_trigger or 0.0) + threshold:
+                            self._cancel_sl_order(symbol, position)
+                            self._place_sl_m_order(symbol, position, new_sl)
+            # Ladder SL is the exit trigger; if it's breached, exit here.
+            if ltp <= position.stop_loss:
+                self._cancel_sl_and_market_exit(symbol, position, "PROFIT_LADDER_STOP")
+                return
+
         # Continuous trailing (premium points). Once profit reaches trail_start,
         # lock = highest_favorable_profit - gap, floored at initial lock.
-        if CONFIG.trade_mgmt.enable_trailing_after_breakeven and position.initial_sl > 0:
+        # Disabled when the profit ladder is active (they would fight over stop_loss).
+        if (
+            CONFIG.trade_mgmt.enable_trailing_after_breakeven
+            and position.initial_sl > 0
+            and not (CONFIG.trade_mgmt.enable_profit_ladder and position.ladder_active)
+        ):
             start = getattr(CONFIG.trade_mgmt, "trail_start_premium_points", CONFIG.trade_mgmt.trail_trigger_premium_points)
             initial_lock = getattr(CONFIG.trade_mgmt, "trail_initial_lock_premium_points", CONFIG.trade_mgmt.trail_lock_premium_points)
             gap = getattr(CONFIG.trade_mgmt, "trail_gap_premium_points", 2.0)
@@ -244,8 +287,9 @@ class OrderManager:
             position._peak_profit = peak
             if profit >= start and peak >= start:
                 lock_profit = max(initial_lock, peak - gap)
-                if position.side == TradeSide.LONG:
-                    new_sl_trigger = position.entry_price + lock_profit
+                # Buy-only: every position is a long buy, so the walked-up SL is
+                # always entry + lock_profit (premium rising = profit).
+                new_sl_trigger = position.entry_price + lock_profit
 
                 improved = new_sl_trigger > position.stop_loss
                 if improved:
@@ -285,10 +329,9 @@ class OrderManager:
             if not position.sl_order_id:
                 lock = CONFIG.trade_mgmt.immediate_trail_lock_points
                 if lock > 0:
-                    if position.side == TradeSide.LONG:
-                        position.stop_loss = max(position.stop_loss, position.entry_price + lock)
-                    else:
-                        position.stop_loss = min(position.stop_loss, position.entry_price - lock)
+                    # Buy-only: every position is a long buy, so the immediate
+                    # SL lock sits ABOVE entry (premium rising = profit).
+                    position.stop_loss = max(position.stop_loss, position.entry_price + lock)
                     _log.info("IMMEDIATE_SL_LOCK | symbol=%s | side=%s | new_sl=%.2f | lock_points=%.1f",
                               symbol, position.side.value, position.stop_loss, lock)
                 self._place_sl_order(symbol, position)
@@ -371,10 +414,9 @@ class OrderManager:
 
                 lock = CONFIG.trade_mgmt.immediate_trail_lock_points
                 if lock > 0:
-                    if position.side == TradeSide.LONG:
-                        position.stop_loss = max(position.stop_loss, position.entry_price + lock)
-                    else:
-                        position.stop_loss = min(position.stop_loss, position.entry_price - lock)
+                    # Buy-only: every position is a long buy, so the immediate
+                    # SL lock sits ABOVE entry (premium rising = profit).
+                    position.stop_loss = max(position.stop_loss, position.entry_price + lock)
                     _log.info("IMMEDIATE_SL_LOCK | symbol=%s | side=%s | new_sl=%.2f | lock_points=%.1f",
                               symbol, position.side.value, position.stop_loss, lock)
 
@@ -440,12 +482,11 @@ class OrderManager:
 
     def _place_sl_order(self, symbol: str, position: Position) -> None:
         sl_offset = CONFIG.trade_mgmt.sl_limit_offset_points
-        if position.side == TradeSide.LONG:
-            sl_trigger = position.stop_loss
-            sl_limit = sl_trigger + sl_offset
-        else:
-            sl_trigger = position.stop_loss
-            sl_limit = sl_trigger - sl_offset
+        # Buy-only strategy: every position is a long buy (CE or PE), so the SL
+        # exit is always a sell-limit placed ABOVE the trigger (fills as price
+        # falls to the stop). Same shape for both option types.
+        sl_trigger = position.stop_loss
+        sl_limit = sl_trigger + sl_offset
 
         order_type = CONFIG.trade_mgmt.sl_order_type
 
@@ -498,7 +539,8 @@ class OrderManager:
 
         sl_offset = CONFIG.trade_mgmt.sl_limit_offset_points
         new_trigger = round(position.stop_loss, 2)
-        new_limit = round(new_trigger + sl_offset, 2) if position.side == TradeSide.LONG else round(new_trigger - sl_offset, 2)
+        # Buy-only: SL exit is always a sell-limit placed above the trigger.
+        new_limit = round(new_trigger + sl_offset, 2)
 
         try:
             order_type = CONFIG.trade_mgmt.sl_order_type
@@ -627,10 +669,9 @@ class OrderManager:
 
             transaction_type = "SELL"
             buffer_pct = CONFIG.trade_mgmt.exit_limit_buffer_pct
-            limit_price = round(
-                exit_price * (1 - buffer_pct) if position.side == TradeSide.LONG else exit_price * (1 + buffer_pct),
-                2,
-            )
+            # Buy-only: every position is a long buy, so the exit limit sits
+            # BELOW the target price (fills as premium falls). Same for CE/PE.
+            limit_price = round(exit_price * (1 - buffer_pct), 2)
             _log.info(
                 "ORDER_REQUEST | symbol=%s transaction_type=%s quantity=%d order_type=LIMIT price=%.2f trigger_price=None product=%s exchange=%s caller=_close_position reason=%s",
                 symbol, transaction_type, position.quantity, limit_price, CONFIG.capital.product_type, CONFIG.instrument.option_exchange, reason,
@@ -885,9 +926,9 @@ class OrderManager:
     # ------------------------------------------------------------
 
     def _compute_pnl(self, position: Position, exit_price: float) -> float:
-        if position.side == TradeSide.LONG:
-            return (exit_price - position.entry_price) * position.quantity
-        return (position.entry_price - exit_price) * position.quantity
+        # Buy-only strategy: both CE and PE are long buys, so P&L is always
+        # (exit - entry) * qty. Premium rising = profit for either option type.
+        return (exit_price - position.entry_price) * position.quantity
 
     def _get_order_status(self, order_id: str) -> Optional[str]:
         try:
@@ -1234,7 +1275,9 @@ class OrderManager:
                 position.stop_loss = new_trigger
                 self._modify_sl_order(symbol, position)
         else:
-            if order_trigger > position.stop_loss + 1e-6:
+            # Buy-only: PE positions are also long buys, so they use the same
+            # SL-below-entry shape as CE. Kept for safety (no-op in practice).
+            if order_trigger < position.stop_loss - 1e-6:
                 _log.warning("SL_WATCHDOG_REPAIR_REQUIRED | symbol=%s | reason=SL_TRAILING_BEHIND order_trigger=%.2f current_sl=%.2f", symbol, order_trigger, position.stop_loss)
                 new_trigger = round(position.stop_loss, 2)
                 position.stop_loss = new_trigger

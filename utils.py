@@ -204,8 +204,13 @@ class Position:
     exit_avg_price: float = 0.0
     exit_requested_at: Optional[str] = None
     exit_filled_at: Optional[str] = None
-    last_reconciled_at: Optional[str] = None
+    exit_market_fallback_used: bool = False
+    exit_fallback_quantity: int = 0
     exit_limit_order_id: Optional[str] = None
+    # ---- Profit ladder state (Option A) ----
+    ladder_active: bool = False
+    ladder_last_target_hit: float = 0.0
+    ladder_target: float = 0.0
     exit_market_fallback_used: bool = False
     exit_fallback_quantity: int = 0
     entry_requested_at: Optional[str] = None

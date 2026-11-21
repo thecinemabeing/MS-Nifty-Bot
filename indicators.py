@@ -95,6 +95,55 @@ def adx(candles: list[Candle], period: int) -> Optional[float]:
     return sum(dx_values[-period:]) / period
 
 
+def adx_directional(candles: list[Candle], period: int) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Returns (adx, plus_di, minus_di) using Wilder smoothing.
+
+    Same calculation as adx() but also exposes the directional indicators
+    needed for the "trend alignment" entry rule (plus_di > minus_di etc.).
+    """
+    if len(candles) < period * 2:
+        return None, None, None
+
+    plus_dm, minus_dm, trs = [], [], []
+    for i in range(1, len(candles)):
+        up_move = candles[i].high - candles[i - 1].high
+        down_move = candles[i - 1].low - candles[i].low
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
+        trs.append(true_range(candles[i - 1].close, candles[i].high, candles[i].low))
+
+    def wilder_smooth(values: list[float], period: int) -> list[float]:
+        smoothed = [sum(values[:period])]
+        for v in values[period:]:
+            smoothed.append(smoothed[-1] - (smoothed[-1] / period) + v)
+        return smoothed
+
+    if len(trs) < period:
+        return None, None, None
+
+    smoothed_tr = wilder_smooth(trs, period)
+    smoothed_plus_dm = wilder_smooth(plus_dm, period)
+    smoothed_minus_dm = wilder_smooth(minus_dm, period)
+
+    plus_di_vals, minus_di_vals, dx_vals = [], [], []
+    for tr_s, pdm_s, mdm_s in zip(smoothed_tr, smoothed_plus_dm, smoothed_minus_dm):
+        if tr_s == 0:
+            plus_di_vals.append(0.0); minus_di_vals.append(0.0); dx_vals.append(0.0)
+            continue
+        plus_di = 100 * (pdm_s / tr_s)
+        minus_di = 100 * (mdm_s / tr_s)
+        di_sum = plus_di + minus_di
+        dx = 100 * (abs(plus_di - minus_di) / di_sum) if di_sum != 0 else 0.0
+        plus_di_vals.append(plus_di)
+        minus_di_vals.append(minus_di)
+        dx_vals.append(dx)
+
+    if len(dx_vals) < period:
+        return None, None, None
+    adx_val = sum(dx_vals[-period:]) / period
+    return adx_val, plus_di_vals[-1], minus_di_vals[-1]
+
+
 @dataclass
 class CandleShape:
     body: float
